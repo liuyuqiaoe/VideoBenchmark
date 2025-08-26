@@ -264,9 +264,10 @@ def get_ucf101_video_paths(dataset_dir = ""):
 class UCF101VideoPathCollector:
     def __init__(self, dataset_dir = " ", experiment_root = " "):
         if experiment_root == " " or not os.path.exists(experiment_root):
-            self.experiment_root = os.path.join(os.getcwd(), "VideoBenchmark/UCF101_list")
+            self.experiment_root = os.path.join(os.getcwd(), "UCF101_list")
             print(f"No input or invalid experiment_root {experiment_root}, set experiment_root to default: {self.experiment_root}")
-        self.experiment_root = experiment_root
+        else:
+            self.experiment_root = experiment_root
         os.makedirs(self.experiment_root, exist_ok=True)
         self.dataset_dir = dataset_dir
         self.video_extensions = {'.avi', '.mp4', '.mov', '.mkv', '.wmv'}
@@ -346,7 +347,7 @@ class UCF101VideoPathCollector:
     def json_to_list(file_name = "ucf101_video_paths", experiment_root = " "):
         if experiment_root == " " or not os.path.exists(experiment_root):
             invalid_root = experiment_root
-            experiment_root = os.path.join(os.getcwd(), "VideoBenchmark/UCF101_list")
+            experiment_root = os.path.join(os.getcwd(), "UCF101_list")
             print(f"No input or invalid experiment_root: {invalid_root}, set experiment_root to default: {experiment_root}")
         os.makedirs(experiment_root, exist_ok=True)
         if not (file_name.split(".")[-1] == "json"):
@@ -365,7 +366,7 @@ class UCF101VideoPathCollector:
     def json_create_batches(batch_size = 64, file_name = "ucf101_video_paths", experiment_root = " "):
         if experiment_root == " " or not os.path.exists(experiment_root):
             invalid_root = experiment_root
-            experiment_root = os.path.join(os.getcwd(), "VideoBenchmark/UCF101_list")
+            experiment_root = os.path.join(os.getcwd(), "UCF101_list")
             print(f"No input or invalid experiment_root: {invalid_root}, set experiment_root to default: {experiment_root}")
         os.makedirs(experiment_root, exist_ok=True)
 
@@ -413,7 +414,7 @@ class UCF101VideoPathCollector:
     def load_batch_file(file_name = "ucf101_video_paths", experiment_root = " "):
         if experiment_root == " " or not os.path.exists(experiment_root):
             invalid_root = experiment_root
-            experiment_root = os.path.join(os.getcwd(), "VideoBenchmark/UCF101_list")
+            experiment_root = os.path.join(os.getcwd(), "UCF101_list")
             print(f"No input or invalid experiment_root: {invalid_root}, set experiment_root to default: {experiment_root}")
         os.makedirs(experiment_root, exist_ok=True)
 

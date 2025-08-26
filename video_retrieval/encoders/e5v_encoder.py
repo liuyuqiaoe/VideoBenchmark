@@ -69,11 +69,35 @@ class E5VVideoEncoder:
                 output_hidden_states=True, 
                 return_dict=True
             ).hidden_states[-1][:, -1, :]
-        
+        del img_inputs
         img_embs = F.normalize(img_embs, dim=-1)
-
         return img_embs
     
+    def encode_image_from_paths(self, image_paths):
+        processed_images = []
+        for img_path in image_paths:
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"Image not found: {img_path}")
+            img = Image.open(img_path)
+           
+            if img.mode in ('P', 'LA', 'PA'):
+                img = img.convert('RGBA').convert('RGB')
+            else:
+                img = img.convert('RGB')
+            processed_images.append(img)
+        batch_size = 3
+        batch_max = ((len(processed_images) -1) // batch_size) + 1
+        img_embs = []
+        for batch_idx in tqdm(range(batch_max)):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size - 1, len(processed_images)-1)
+            batch_img_embs = self.encode_image(processed_images[start_idx:end_idx+1])
+            if batch_img_embs.dim() == 1:
+                batch_img_embs.unsqueeze(0)
+            img_embs.append(batch_img_embs)
+            del batch_img_embs
+        return torch.cat(img_embs, dim=0)
+
     def encode_video(self, video_path, force_rebuild_frames = False):
 
         video_frames = self.extractor.extract_frames_batch([video_path], force_rebuild_frames)

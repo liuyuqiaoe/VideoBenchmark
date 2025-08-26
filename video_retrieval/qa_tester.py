@@ -3,6 +3,7 @@ import os
 from typing import Dict, List, Any, Optional, Callable
 from video_retrieval.encoders.intern_video2_encoder import InternVideo2Encoder
 from video_retrieval.encoders.e5v_encoder import E5VVideoEncoder
+from video_retrieval.encoders.llava_qwen_encoder import LLaVAQwenEncoder
 from tqdm import tqdm
 from video_retrieval.video_indexer import LanceDBVideoIndex, LanceDBVideoRetriever
 
@@ -453,7 +454,8 @@ if __name__ == "__main__":
     # }
     db_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/ufc101_db"
     db_path_iv2 = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/ufc101_iv2_db"
-    ans_file_root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_23"
+    db_path_llava = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/ufc101_llava_db"
+    ans_file_root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_26_experiments/results_description_llava"
     os.makedirs(ans_file_root, exist_ok=True)
     config_8_22_multi_descriptions = {
         "ans_file_ucf101_vqa_multiple_descriptions": {
@@ -581,10 +583,60 @@ if __name__ == "__main__":
         }
     }
 
+    # cosine max min
+    config_8_25_ev5_description_cosine_mean = {
+        "ans_file_8_25_ev5_description_cosine_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_8_25_ev5_description_cosine_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        },
+        "ans_file_8_25_ev5_description_cosine_mean_gt": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_8_25_ev5_description_cosine_mean_gt.json"),
+            "return_all": False,
+            "where_clause": True,
+            "only_label": False
+        },
+        "ans_file_8_25_ev5_description_cosine_mean_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_8_25_ev5_description_cosine_mean_return_all.json"),
+            "return_all": True,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+
+    config_8_26_llava_description_cosine_max_mean = {
+        "ans_file_8_26_llava_description_cosine_max_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_8_26_llava_description_cosine_max_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        },
+        "ans_file_8_26_llava_description_cosine_max_mean_gt": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_8_26_llava_description_cosine_max_mean_gt.json"),
+            "return_all": False,
+            "where_clause": True,
+            "only_label": False
+        },
+        "ans_file_8_26_llava_description_cosine_max_mean_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_8_26_llava_description_cosine_max_mean_return_all.json"),
+            "return_all": True,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+
+
     p= "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json"
     # iv2_encoder = InternVideo2Encoder()
-    e5v_encoder = E5VVideoEncoder()
+    llava_encoder = LLaVAQwenEncoder()
     similarity_type = "cosine_max_mean"
-    run_test_configurations(config_8_23_ev5_description_cosine_mean, db_path, e5v_encoder, similarity_type)
+    run_test_configurations(config_8_26_llava_description_cosine_max_mean, db_path_llava, llava_encoder, similarity_type)
     
     

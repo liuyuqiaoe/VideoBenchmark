@@ -55,6 +55,25 @@ class InternVideo2Schema(LanceModel):
     embedding_shape: List[int]  # (1, 1024) for each frame
     video_embedding_shape: List[int]  # (num_frames, 1024) for the full video embedding
 
+class LLaVAQwenSchema(LanceModel):
+    id: str
+    video_path: str
+    video_name: str
+    action_category: str
+    video_index: int
+    frame_index: int
+    total_frames: int
+    embedding: Vector(3584) # frame-level embeddings
+    frame_description: str
+    batch_file: str
+    batch_idx: int
+    # Embedding metadata
+    encoder_type: str  # "internvideo2"
+    embedding_dim: int  # 1024
+    num_frames: int  # Number of frames
+    embedding_shape: List[int]  # (1, 1024) for each frame
+    video_embedding_shape: List[int]  # (num_frames, 1024) for the full video embedding
+
 def safe_tensor_to_numpy(tensor):
     if tensor is None:
         return None
@@ -67,7 +86,7 @@ def safe_tensor_to_numpy(tensor):
     
     return tensor.cpu().numpy()
 
-def colbert_maxsim(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None):
+def colbert_maxsim_max(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None):
     query_norm = F.normalize(query_emb, p=2, dim=-1)  # [total_query_tokens, embedding_dim]
     video_norm = F.normalize(video_emb, p=2, dim=-1)  # [total_video_frames, embedding_dim]
     
@@ -84,12 +103,35 @@ def colbert_maxsim(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token
             end_idx = start_idx + token_num
             query_sim = s[start_idx:end_idx]  # [token_num, video_num, frame_num]
             max_sim_per_token = query_sim.max(dim=2).values  # [token_num, video_num]
-            similarities.append(max_sim_per_token.sum(dim=0))  # [video_num]
+            similarities.append(max_sim_per_token.max(dim=0))  # [video_num]
             start_idx = end_idx
         return torch.stack(similarities)  # [num_queries, video_num]
     else:
         max_sim_per_token = s.max(dim=2).values  # [total_query_tokens, video_num]
-        return max_sim_per_token.sum(dim=0)  # [video_num]
+        return max_sim_per_token.max(dim=0)  # [video_num]
+def colbert_maxsim_mean(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None):
+    query_norm = F.normalize(query_emb, p=2, dim=-1)  # [total_query_tokens, embedding_dim]
+    video_norm = F.normalize(video_emb, p=2, dim=-1)  # [total_video_frames, embedding_dim]
+    
+    s = torch.matmul(query_norm, video_norm.T)  # [total_query_tokens, total_video_frames]
+    
+    # [total_query_tokens, total_video_frames] -> [total_query_tokens, video_num, frame_num]
+    if video_num is not None:
+        s = s.view(query_emb.shape[0], video_num, -1) 
+    
+    if query_token_nums is not None:
+        similarities = []
+        start_idx = 0
+        for token_num in query_token_nums:
+            end_idx = start_idx + token_num
+            query_sim = s[start_idx:end_idx]  # [token_num, video_num, frame_num]
+            max_sim_per_token = query_sim.max(dim=2).values  # [token_num, video_num]
+            similarities.append(max_sim_per_token.mean(dim=0))  # [video_num]
+            start_idx = end_idx
+        return torch.stack(similarities)  # [num_queries, video_num]
+    else:
+        max_sim_per_token = s.max(dim=2).values  # [total_query_tokens, video_num]
+        return max_sim_per_token.mean(dim=0)  # [video_num]
 
 def cosine_mean(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None):
     """
@@ -207,20 +249,27 @@ SIMILARITY_FUNCTIONS = {
     "dot_mean": dot_mean,
     "dot_max": dot_max,
     "euclidean": euclidean_similarity,
-    "colbert_maxsim": colbert_maxsim
+    "colbert_maxsim_max": colbert_maxsim_max,
+    "colbert_maxsim_mean": colbert_maxsim_mean
 }
 
 ENCODER_CONFIGS = {
     "e5v": {
         "schema_class": E5Vschema,
         "embedding_dim": 4096,
-        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim"],
+        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim_max", "colbert_maxsim_mean"],
         "default_similarity": "cosine_max_mean"
     },
     "internvideo2": {
         "schema_class": InternVideo2Schema,
         "embedding_dim": 1024,
-        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim"],
+        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean"],
+        "default_similarity": "cosine_max_mean"
+    },
+    "llavaqwen": {
+        "schema_class": LLaVAQwenSchema,
+        "embedding_dim": 3584,
+        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean"],
         "default_similarity": "cosine_max_mean"
     }
 }
@@ -233,10 +282,12 @@ def detect_encoder_type(encoder):
         return "e5v" 
     
     class_name = encoder.__class__.__name__.lower()
-    if 'internvideo2' in class_name:
+    if "internvideo2" in class_name:
         return "internvideo2"
-    elif 'e5' in class_name:
+    elif "e5" in class_name:
         return "e5v"
+    elif "llavaqwen" in class_name:
+        return "llavaqwen"
 
     return "e5v"  
 
@@ -288,15 +339,57 @@ class LanceDBVideoIndex:
             action_category = os.path.basename(os.path.dirname(video_path)) 
             total_frames = len(frame_embeddings)
             
-            if self.encoder_type == "internvideo2":
-                frame_embedding_shape = [1, self.encoder_config["embedding_dim"]]  # [1, 1024] for each frame
-                video_embedding_shape = [int(total_frames), self.encoder_config["embedding_dim"]]  # [num_frames, 1024] for video
-            else:
-                frame_embedding_shape = [1, self.encoder_config["embedding_dim"]]  # [1, 4096] for E5V frames
-                video_embedding_shape = [1, self.encoder_config["embedding_dim"]] # [1, 4096] for E5V frames
+            frame_embedding_shape = [1, self.encoder_config["embedding_dim"]]  # [1, 4096] for E5V frames, [1, 1024] for internvideo2
+            video_embedding_shape = [total_frames, self.encoder_config["embedding_dim"]] # [8, 4096] for E5V frames, [8, 1024] for internvideo 2
             
             for frame_idx, frame_embedding in enumerate(frame_embeddings):
                 frame_id = f"video_{video_idx}_frame_{frame_idx}"
+                
+                record = {
+                    "id": frame_id,
+                    "video_path": video_path,
+                    "video_name": video_name,
+                    "action_category": action_category,
+                    "video_index": video_idx,
+                    "frame_index": frame_idx, # frame index inside video frames
+                    "total_frames": total_frames,
+                    "embedding": frame_embedding.tolist(), 
+                    "frame_description": f"Frame {frame_idx} of {video_name}",
+                    "batch_file": metadata[video_idx]["batch_file"],
+                    "batch_idx": metadata[video_idx]["batch_idx"],
+                    "encoder_type": self.encoder_type,
+                    "embedding_dim": self.encoder_config["embedding_dim"],
+                    "num_frames": total_frames, # same as total_frames
+                    "embedding_shape": frame_embedding_shape,  
+                    "video_embedding_shape": video_embedding_shape 
+                }
+                
+                # if metadata and video_idx < len(metadata):
+                #     record.update(metadata[video_idx])
+                
+                records.append(record)
+    
+        df = pd.DataFrame(records)
+        self.table.add(df)
+        
+        print(f"Added {len(video_paths)} videos with {len(records)} independent frame records to LanceDB index")
+    
+    def add_images(self, video_frame_embeddings: List[np.ndarray], video_paths, metadata = None):
+        if len(video_frame_embeddings) != len(video_paths):
+            raise ValueError("Number of image embeddings must match number of image paths")
+        
+        records = []
+        
+        for video_idx, (frame_embeddings, video_path) in enumerate(zip(video_frame_embeddings, video_paths)):
+            video_name = video_path
+            action_category = "None"
+            total_frames = len(frame_embeddings)
+            
+            frame_embedding_shape = [1, self.encoder_config["embedding_dim"]]  # [1, 4096] for E5V frames, [1, 1024] for internvideo2
+            video_embedding_shape = [total_frames, self.encoder_config["embedding_dim"]] # [8, 4096] for E5V frames, [8, 1024] for internvideo 2
+            
+            for frame_idx, frame_embedding in enumerate(frame_embeddings):
+                frame_id = f"image_{video_idx}_frame_{frame_idx}"
                 
                 record = {
                     "id": frame_id,
@@ -434,7 +527,6 @@ class LanceDBVideoIndex:
         if isinstance(top_k, int):
             top_k_list = [top_k] * num_queries
         else:
-            # Ensure top_k list has the same length as number of queries
             if len(top_k) != num_queries:
                 raise ValueError(f"Length of top_k list ({len(top_k)}) must match number of queries ({num_queries})")
             top_k_list = top_k
@@ -482,6 +574,36 @@ class LanceDBVideoIndex:
         
         return query_results
     
+    def search_clean(self, query_embedding: np.ndarray, queries, query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause: str = " ", return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None):
+        
+        if similarity_type is None and encoder_config is not None:
+            similarity_type = encoder_config["default_similarity"]
+        
+        if encoder_config is not None and similarity_type not in encoder_config["similarity_methods"]:
+            raise ValueError(f"Similarity method '{similarity_type}' not supported for encoder '{encoder_type}'. Available methods: {encoder_config['similarity_methods']}")
+        
+        num_queries = 1 if query_token_nums is None else len(query_token_nums)
+        
+        start_time = time.time()
+
+        if isinstance(top_k, int):
+            top_k_list = [top_k] * num_queries
+        else:
+            if len(top_k) != num_queries:
+                raise ValueError(f"Length of top_k list ({len(top_k)}) must match number of queries ({num_queries})")
+            top_k_list = top_k
+        
+        results = self._search_with_similarity(query_embedding, query_token_nums, top_k_list, where_clause, return_all, similarity_type)
+        
+        query_results = {}
+        
+        for query_idx, query_results_list in results.items():
+            formatted_results = []
+            for video_path, similarity, video_index in query_results_list:
+                formatted_results.append((video_path, similarity))
+            query_results[query_idx] = formatted_results
+            
+        return query_results
 
 
     def _search_with_similarity(self, query_embedding: np.ndarray, query_token_nums: List[int] = None, top_k: List[int] = None, where_clause = " ", return_all = False, similarity_type = None):
@@ -619,7 +741,6 @@ class LanceDBVideoRetriever:
         self.max_frames_per_video = max_frames_per_video
         
         self.encoder_config = get_encoder_config(encoder_type)
-        
         print(f"LanceDB video retrieval system initialized with {max_frames_per_video} frames per video (encoder: {encoder_type}).")
         print(f"Available similarity methods: {self.encoder_config['similarity_methods']}")
 
@@ -677,6 +798,51 @@ class LanceDBVideoRetriever:
             self.index.add_videos(video_frame_embeddings, successful_paths, metadata)
         else:
             print("No videos were successfully encoded")
+    
+    def build_index_image(self, video_paths, batch_file="None", batch_idx=-1, force_rebuild_frames=False):
+        print(f"Building index for {len(video_paths)} images...")
+        if not self.encoder:
+            print("No encoder, please set an encoder, or using LanceDBVideoRetriever.build_index_no_encoder() instead.")
+            return
+        img_embeddings = self.encoder.encode_image_from_paths(video_paths)
+        video_frame_embeddings = []
+        successful_paths = []
+        metadata = []
+        
+        for i, video_path in enumerate(tqdm(
+            video_paths, 
+            total=len(video_paths),
+            desc="Encoding images",
+            unit="image"
+        )):
+            # tensor: [1, dim]
+            # frame_embeddings = self.encoder.encode_video(video_path, force_rebuild_frames)
+            frame_embeddings = img_embeddings[i]
+            if frame_embeddings.dim() == 1:
+                frame_embeddings = frame_embeddings.unsqueeze(0)
+            if frame_embeddings is not None:
+                # frame_embeddings: (num_frames=1, embedding_dim)
+                video_frame_embeddings.append(safe_tensor_to_numpy(frame_embeddings)) # ndarray
+                successful_paths.append(video_path)
+                video_name = video_path
+                action_category = "None"
+                metadata.append({
+                    "video_path": video_path,
+                    "video_name": video_name,
+                    "action_category": action_category,
+                    "index": i, # index inside batch, can be removed?
+                    "num_frames": frame_embeddings.shape[0], # 1
+                    "batch_file": batch_file,
+                    "batch_idx": batch_idx # index of batch, gotten by batch file
+                })
+               
+            else:
+                print(f"Failed to encode {video_path}")
+        
+        if video_frame_embeddings:
+            self.index.add_images(video_frame_embeddings, successful_paths, metadata)
+        else:
+            print("No images were successfully encoded")
 
     def build_index_no_encoder(self, video_paths, batch_file="None", batch_idx=-1, force_rebuild_frames = False, video_embeddings=None):
         pass
@@ -697,7 +863,7 @@ class LanceDBVideoRetriever:
             return {}
         
         # TODO: internvideo2 encode texts by batch
-        if self.encoder_type == "internvideo2":
+        if self.encoder_type in ["internvideo2", "llavaqwen"]:
             # encode each query separately and concatenate
             query_embeddings = []
             for query in queries:
@@ -746,6 +912,130 @@ class LanceDBVideoRetriever:
         # }
         return results
 
+    def search_clean(self, queries, top_k = 5, where_clause = " ", return_all = False, similarity_type = None):
+        if not self.encoder:
+            print("No encoder, please set an encoder.")
+            return {}
+        
+        if isinstance(queries, str):
+            queries = [queries]
+        
+        if not queries:
+            print("No queries provided.")
+            return {}
+        
+        # TODO: internvideo2 encode texts by batch
+        if self.encoder_type == "internvideo2":
+            # encode each query separately and concatenate
+            query_embeddings = []
+            for query in queries:
+                query_emb = self.encoder.encode_text(query)
+                if query_emb.dim() == 3:
+                    query_emb = query_emb.squeeze(0)
+                if query_emb is not None:
+                    query_embeddings.append(query_emb)
+
+            if not query_embeddings:
+                print("Failed to encode any queries")
+                return {}
+
+            query_embedding = torch.cat(query_embeddings, dim=0)  # torch.bfloat16 tensor: [query_num, num_tokens, embedding_dim]
+            query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
+            query_token_nums = [emb.shape[0] for emb in query_embeddings]  # List of token counts per query
+        else:
+            # encode all queries at once
+            query_embedding = self.encoder.encode_text(queries) # torch.float16 tensor: [query_num, embedding_dim]
+            if query_embedding is None:
+                print("Failed to encode queries")
+                return {}
+            query_token_nums = [1] * len(queries)  
+        
+        if query_embedding is None:
+            print("Failed to encode queries")
+            return {}
+
+        results = self.index.search_clean( 
+            safe_tensor_to_numpy(query_embedding),
+            queries, 
+            query_token_nums,
+            top_k, 
+            where_clause, 
+            return_all, 
+            similarity_type, 
+            self.encoder_type, 
+            self.encoder_config
+        )
+        
+        return results
+    
+    def search_image(self, images, top_k = 5, where_clause = " ", return_all = False, similarity_type = None):
+        if not self.encoder:
+            print("No encoder, please set an encoder.")
+            return {}
+        
+        if isinstance(images, Image.Image):
+            images = [images]
+        
+        if not images:
+            print("No images provided.")
+            return {}
+        
+        # TODO: internvideo2 encode texts by batch
+        if self.encoder_type == "internvideo2":
+            # encode each query separately and concatenate
+            query_embeddings = []
+            for query in queries:
+                query_emb = self.encoder.encode_text(query)
+                if query_emb.dim() == 3:
+                    query_emb = query_emb.squeeze(0)
+                if query_emb is not None:
+                    query_embeddings.append(query_emb)
+
+            if not query_embeddings:
+                print("Failed to encode any queries")
+                return {}
+
+            query_embedding = torch.cat(query_embeddings, dim=0)  # torch.bfloat16 tensor: [query_num, num_tokens, embedding_dim]
+            query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
+            query_token_nums = [emb.shape[0] for emb in query_embeddings]  # List of token counts per query
+        else:
+            # encode all queries at once
+            batch_size = 3
+            batch_max = ((len(images) -1) // batch_size) + 1
+            img_embs = []
+            for batch_idx in tqdm(range(batch_max)):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size - 1, len(images)-1)
+                batch_img_embs = self.encoder.encode_image(images[start_idx:end_idx+1])
+                if batch_img_embs.dim() == 1:
+                    batch_img_embs.unsqueeze(0)
+                img_embs.append(batch_img_embs)
+                del batch_img_embs
+                
+            query_embedding = torch.cat(img_embs, dim=0) # torch.float16 tensor: [query_num, embedding_dim]
+            if query_embedding is None:
+                print("Failed to encode queries")
+                return {}
+            query_token_nums = [1] * len(images)  
+        
+        if query_embedding is None:
+            print("Failed to encode images")
+            return {}
+
+        results = self.index.search_clean( 
+            safe_tensor_to_numpy(query_embedding),
+            images, 
+            query_token_nums,
+            top_k, 
+            where_clause, 
+            return_all, 
+            similarity_type, 
+            self.encoder_type, 
+            self.encoder_config
+        )
+        
+        return results
+
     def formated_results(self, results):
         if not isinstance(results, dict):
             print("Warning: Expected dictionary format for results")
@@ -784,6 +1074,21 @@ class LanceDBVideoRetriever:
                 "total_results": len(query_results)
             }
         return dump_data
+
+    def pure_results(self, results):
+        pure_data = {}
+        
+        for query_idx, query_results in results.items():
+            query_data = []
+            for i, (video_path, similarity, metadata) in enumerate(query_results):
+                query_data.append(video_path)
+            query_text = metadata.get("query_text", f"query_{query_idx}") if query_results else f"query_{query_idx}"
+            pure_data[query_idx] = {
+                "query_tex": query_text,
+                "query_data": query_data
+                }
+                
+        return pure_data
 
     def dump_results(self, results, output_file = "search_results.json"):
         if not isinstance(results, dict):
