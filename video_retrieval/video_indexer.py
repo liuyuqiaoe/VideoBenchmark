@@ -15,6 +15,7 @@ import lancedb
 from lancedb.pydantic import Vector, LanceModel
 import pandas as pd
 from tqdm import tqdm
+from video_retrieval.stanford40action.utils import resize_and_patch_images
 
 
 class E5Vschema(LanceModel):
@@ -103,12 +104,13 @@ def colbert_maxsim_max(query_emb: torch.Tensor, video_emb: torch.Tensor, query_t
             end_idx = start_idx + token_num
             query_sim = s[start_idx:end_idx]  # [token_num, video_num, frame_num]
             max_sim_per_token = query_sim.max(dim=2).values  # [token_num, video_num]
-            similarities.append(max_sim_per_token.max(dim=0))  # [video_num]
+            similarities.append(max_sim_per_token.max(dim=0).values)  # [video_num]
             start_idx = end_idx
         return torch.stack(similarities)  # [num_queries, video_num]
     else:
         max_sim_per_token = s.max(dim=2).values  # [total_query_tokens, video_num]
-        return max_sim_per_token.max(dim=0)  # [video_num]
+        return max_sim_per_token.max(dim=0).values  # [video_num]
+
 def colbert_maxsim_mean(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None):
     query_norm = F.normalize(query_emb, p=2, dim=-1)  # [total_query_tokens, embedding_dim]
     video_norm = F.normalize(video_emb, p=2, dim=-1)  # [total_video_frames, embedding_dim]
@@ -430,13 +432,7 @@ class LanceDBVideoIndex:
         if similarity_type not in self.encoder_config["similarity_methods"]:
             raise ValueError(f"Similarity method '{similarity_type}' not supported for encoder '{self.encoder_type}'. Available methods: {self.encoder_config['similarity_methods']}")
         query_emb = torch.tensor(query_embedding, dtype=torch.float32)
-        # if query_emb.dim() == 3:  # [num_queries, num_tokens, embedding_dim]
-        #     query_token_nums = [query_emb[i].shape[0] for i in range(query_emb.shape[0])]
-        #     query_emb_flat = query_emb.view(-1, query_emb.shape[-1])
-        # else:  # single query: [num_tokens, embedding_dim]
-        #     query_token_nums = None
-        #     query_emb_flat = query_emb
-        # TODO: redundant?
+        
         query_emb_flat = query_emb
         
         results = self.table.to_pandas()
@@ -508,7 +504,7 @@ class LanceDBVideoIndex:
         
         return video_similarities
     
-    def search(self, query_embedding: np.ndarray, queries: List[str], query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause: str = " ", return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None):
+    def search(self, query_embedding: np.ndarray, queries, query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause = [], return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None):
         """
         query_embedding: [total_tokens_num, embedding_dim]
         queries: List of original query texts
@@ -530,7 +526,7 @@ class LanceDBVideoIndex:
             if len(top_k) != num_queries:
                 raise ValueError(f"Length of top_k list ({len(top_k)}) must match number of queries ({num_queries})")
             top_k_list = top_k
-        
+
         results = self._search_with_similarity(query_embedding, query_token_nums, top_k_list, where_clause, return_all, similarity_type)
         # results = {
         #     query_idx: [
@@ -545,6 +541,7 @@ class LanceDBVideoIndex:
         
         for query_idx, query_results_list in results.items():
             formatted_results = []
+       
             for video_path, similarity, video_index in query_results_list:
                 metadata = {
                     "video_path": video_path,
@@ -564,6 +561,7 @@ class LanceDBVideoIndex:
                 }
                 formatted_results.append((video_path, similarity, metadata))
             query_results[query_idx] = formatted_results
+     
             # query_results = {
             #     query_idx: [
             #         (video_path, similarity, metadata),
@@ -606,13 +604,15 @@ class LanceDBVideoIndex:
         return query_results
 
 
-    def _search_with_similarity(self, query_embedding: np.ndarray, query_token_nums: List[int] = None, top_k: List[int] = None, where_clause = " ", return_all = False, similarity_type = None):
+    def _search_with_similarity(self, query_embedding: np.ndarray, query_token_nums: List[int] = None, top_k: List[int] = None, where_clause = [], return_all = False, similarity_type = None):
         if return_all:
             results = self.table.to_pandas()
-        elif where_clause == " ":  
+        elif not where_clause:  
             results = self.table.to_pandas()
         else:
-            results = self.table.where(where_clause).to_pandas()
+            # TODO:
+            # results = self.table.where(where_clause[0]).to_pandas()
+            results = self.table.to_pandas()
         
         # video_similarities = {
         #     video_path:{              
@@ -844,13 +844,57 @@ class LanceDBVideoRetriever:
         else:
             print("No images were successfully encoded")
 
+    def build_index_image_patches(self, video_paths, batch_file="None", batch_idx=-1, force_rebuild_frames=False):
+        print(f"Building index for {len(video_paths)} images...")
+        if not self.encoder:
+            print("No encoder, please set an encoder, or using LanceDBVideoRetriever.build_index_no_encoder() instead.")
+            return
+        
+        img_embeddings = self.encoder.encode_images_patches_from_paths(video_paths) # List[torch.Tensor(10, hidden_dim)]
+        video_frame_embeddings = []
+        successful_paths = []
+        metadata = []
+        
+        for i, video_path in enumerate(tqdm(
+            video_paths, 
+            total=len(video_paths),
+            desc="Encoding images",
+            unit="image"
+        )):
+            frame_embeddings = img_embeddings[i]
+            if frame_embeddings.dim() == 1:
+                frame_embeddings = frame_embeddings.unsqueeze(0)
+            if frame_embeddings is not None:
+                # frame_embeddings: (num_patches, embedding_dim)
+                video_frame_embeddings.append(safe_tensor_to_numpy(frame_embeddings)) 
+                successful_paths.append(video_path)
+                video_name = video_path
+                action_category = os.path.basename(video_path).split(".")[0].split("_")[0].strip()
+                metadata.append({
+                    "video_path": video_path,
+                    "video_name": video_name,
+                    "action_category": action_category,
+                    "index": i, # index inside batch, can be removed?
+                    "num_frames": frame_embeddings.shape[0], # 10
+                    "batch_file": batch_file,
+                    "batch_idx": batch_idx # index of batch, gotten from batch file
+                })
+               
+            else:
+                print(f"Failed to encode {video_path}")
+        
+        if video_frame_embeddings:
+            self.index.add_images(video_frame_embeddings, successful_paths, metadata)
+        else:
+            print("No images were successfully encoded")
+
     def build_index_no_encoder(self, video_paths, batch_file="None", batch_idx=-1, force_rebuild_frames = False, video_embeddings=None):
         pass
 
     def search_no_encoder():
         pass
         
-    def search(self, queries: List[str], top_k = 5, where_clause = " ", return_all = False, similarity_type = None):
+    def search(self, queries, top_k = 5, where_clause = [], return_all = False, similarity_type = None):
         if not self.encoder:
             print("No encoder, please set an encoder.")
             return {}
@@ -858,6 +902,11 @@ class LanceDBVideoRetriever:
         if isinstance(queries, str):
             queries = [queries]
         
+        if isinstance(where_clause, str):
+            where_clause = [where_clause]
+        elif not where_clause :
+            where_clause = []
+
         if not queries:
             print("No queries provided.")
             return {}
@@ -911,6 +960,74 @@ class LanceDBVideoRetriever:
         #     ...
         # }
         return results
+
+    def search_10descriptions_test(self, queries, top_k = 5, where_clause = " ", return_all = False, similarity_type = None):
+        if not self.encoder:
+            print("No encoder, please set an encoder.")
+            return {}
+        
+        if isinstance(queries, str):
+            queries = [queries]
+        
+        if not queries:
+            print("No queries provided.")
+            return {}
+        
+        query_token_nums = []
+
+        if self.encoder_type in ["internvideo2", "llavaqwen"]:
+            query_embeddings = []
+            for query in queries:
+                query_emb = []
+                for sentence in query:
+                    sentence_emb = self.encoder.encode_text(sentence)
+                    if sentence_emb.dim() == 3:
+                        sentence_emb = sentence_emb.squeeze(0)
+                    elif sentence_emb.dim() == 1:
+                        sentence_emb = sentence_emb.unsqueeze(0)
+
+                    if sentence_emb is not None:
+                        query_emb.append(sentence_emb)
+
+                query_emb = torch.cat(query_emb, dim=0)
+                query_token_nums.append(query_emb.shape[0])
+                # query_emb = query_emb.unsqueeze(0)
+                query_embeddings.append(query_emb)
+
+        else:
+            query_embeddings = []
+            for query in queries:
+                query_emb = self.encoder.encode_text(query) # torch.float16 tensor: [sentence_num, embedding_dim]
+                
+                if query_emb is None:
+                    print("Failed to encode queries")
+                    return {}
+                
+                query_token_nums.append(query_emb.shape[0])
+                # query_emb = query_emb.unsqueeze(0)
+                query_embeddings.append(query_emb)
+
+        if not query_embeddings:
+                print("Failed to encode any queries")
+                return {}
+        
+        query_embedding = torch.cat(query_embeddings, dim=0)  # torch.bfloat16 tensor: [query_num, num_tokens, embedding_dim]
+        query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
+  
+        results = self.index.search( 
+            safe_tensor_to_numpy(query_embedding),
+            queries, 
+            query_token_nums,
+            top_k, 
+            where_clause, 
+            return_all, 
+            similarity_type, 
+            self.encoder_type, 
+            self.encoder_config
+        )
+        
+        return results
+
 
     def search_clean(self, queries, top_k = 5, where_clause = " ", return_all = False, similarity_type = None):
         if not self.encoder:

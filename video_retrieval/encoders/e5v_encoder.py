@@ -57,7 +57,7 @@ class E5VVideoEncoder:
             ).hidden_states[-1][:, -1, :]
 
         text_embs = F.normalize(text_embs, dim=-1)
-
+        del text_inputs
         return text_embs
     
     def encode_image(self, images):
@@ -85,7 +85,7 @@ class E5VVideoEncoder:
             else:
                 img = img.convert('RGB')
             processed_images.append(img)
-        batch_size = 3
+        batch_size = 1
         batch_max = ((len(processed_images) -1) // batch_size) + 1
         img_embs = []
         for batch_idx in tqdm(range(batch_max)):
