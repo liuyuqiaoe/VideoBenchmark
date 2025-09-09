@@ -15,7 +15,6 @@ import lancedb
 from lancedb.pydantic import Vector, LanceModel
 import pandas as pd
 from tqdm import tqdm
-from video_retrieval.stanford40action.utils import resize_and_patch_images
 
 
 class E5Vschema(LanceModel):
@@ -57,6 +56,25 @@ class InternVideo2Schema(LanceModel):
     video_embedding_shape: List[int]  # (num_frames, 1024) for the full video embedding
 
 class LLaVAQwenSchema(LanceModel):
+    id: str
+    video_path: str
+    video_name: str
+    action_category: str
+    video_index: int
+    frame_index: int
+    total_frames: int
+    embedding: Vector(3584) # frame-level embeddings
+    frame_description: str
+    batch_file: str
+    batch_idx: int
+    # Embedding metadata
+    encoder_type: str  # "internvideo2"
+    embedding_dim: int  # 1024
+    num_frames: int  # Number of frames
+    embedding_shape: List[int]  # (1, 1024) for each frame
+    video_embedding_shape: List[int]  # (num_frames, 1024) for the full video embedding
+
+class VLM2VecSchema(LanceModel):
     id: str
     video_path: str
     video_name: str
@@ -120,6 +138,36 @@ def colbert_maxsim_mean(query_emb: torch.Tensor, video_emb: torch.Tensor, query_
     # [total_query_tokens, total_video_frames] -> [total_query_tokens, video_num, frame_num]
     if video_num is not None:
         s = s.view(query_emb.shape[0], video_num, -1) 
+    
+    if query_token_nums is not None:
+        similarities = []
+        start_idx = 0
+        for token_num in query_token_nums:
+            end_idx = start_idx + token_num
+            query_sim = s[start_idx:end_idx]  # [token_num, video_num, frame_num]
+            max_sim_per_token = query_sim.max(dim=2).values  # [token_num, video_num]
+            similarities.append(max_sim_per_token.mean(dim=0))  # [video_num]
+            start_idx = end_idx
+        return torch.stack(similarities)  # [num_queries, video_num]
+    else:
+        max_sim_per_token = s.max(dim=2).values  # [total_query_tokens, video_num]
+        return max_sim_per_token.mean(dim=0)  # [video_num]
+
+def colbert_maxsim_mean_weighted(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None, patch_weights: torch.Tensor = None):
+    query_norm = F.normalize(query_emb, p=2, dim=-1)  # [total_query_tokens, embedding_dim]
+    video_norm = F.normalize(video_emb, p=2, dim=-1)  # [total_video_frames, embedding_dim]
+    
+    s = torch.matmul(query_norm, video_norm.T)  # [total_query_tokens, total_video_frames]
+    
+    # [total_query_tokens, total_video_frames] -> [total_query_tokens, video_num, frame_num]
+    if video_num is not None:
+        s = s.view(query_emb.shape[0], video_num, -1) 
+    
+    if patch_weights is not None:
+        patch_weights = patch_weights.to(s.device)
+        # Reshape weights to match the s dimension: [1, 1, frame_num]
+        weights = patch_weights.view(1, 1, -1)
+        s = s * weights
     
     if query_token_nums is not None:
         similarities = []
@@ -252,7 +300,8 @@ SIMILARITY_FUNCTIONS = {
     "dot_max": dot_max,
     "euclidean": euclidean_similarity,
     "colbert_maxsim_max": colbert_maxsim_max,
-    "colbert_maxsim_mean": colbert_maxsim_mean
+    "colbert_maxsim_mean": colbert_maxsim_mean,
+    "colbert_maxsim_mean_weighted": colbert_maxsim_mean_weighted
 }
 
 ENCODER_CONFIGS = {
@@ -271,7 +320,13 @@ ENCODER_CONFIGS = {
     "llavaqwen": {
         "schema_class": LLaVAQwenSchema,
         "embedding_dim": 3584,
-        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean"],
+        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean", "colbert_maxsim_mean_weighted"],
+        "default_similarity": "cosine_max_mean"
+    },
+    "vlm2vec": {
+        "schema_class": VLM2VecSchema,
+        "embedding_dim": 3584,
+        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean", "colbert_maxsim_mean_weighted"],
         "default_similarity": "cosine_max_mean"
     }
 }
@@ -290,6 +345,8 @@ def detect_encoder_type(encoder):
         return "e5v"
     elif "llavaqwen" in class_name:
         return "llavaqwen"
+    elif "vlm2vec" in class_name:
+        return "vlm2vec"
 
     return "e5v"  
 
@@ -303,6 +360,9 @@ class LanceDBVideoIndex:
         
         self.encoder_config = get_encoder_config(encoder_type)
         
+        # add patch weights
+        self.custom_patch_weights = None
+        
         self.db = lancedb.connect(db_path)
         
         try:
@@ -314,6 +374,24 @@ class LanceDBVideoIndex:
             print(f"Created new {encoder_type} table: {table_name}")
         
         print(f"LanceDB index initialized with {max_frames_per_video} frames per video (encoder: {encoder_type})")
+    
+    def _get_patch_weights(self, num_frames, similarity_type):
+        if similarity_type != "colbert_maxsim_mean_weighted":
+            return None
+        
+        if self.encoder_type != "llavaqwen":
+            return None
+        
+        if self.custom_patch_weights is not None:
+            return self.custom_patch_weights
+        else:
+            return torch.ones(num_frames, dtype=torch.float32)
+    
+    def set_patch_weights(self, patch_weights):
+        if isinstance(patch_weights, list):
+            patch_weights = torch.tensor(patch_weights, dtype=torch.float32)
+        self.custom_patch_weights = patch_weights.clone()
+        print(f"Set custom patch weights for {patch_weights.shape[0]} embeddings: {patch_weights.tolist()}")
     
     def get_schema(self, table_name = "video_embeddings"):
         if table_name == self.table_name:
@@ -451,8 +529,10 @@ class LanceDBVideoIndex:
         for video_path, group in grouped:
             video_index = group.iloc[0]['video_index']
             
-            frame_embeddings = [torch.tensor(emb, dtype=torch.float32) for emb in group['embedding'].tolist()]
-            frame_indices = group['frame_index'].tolist()
+            # Sort by frame_index to ensure proper ordering (raw image embedding at largest frame index)
+            group_sorted = group.sort_values('frame_index')
+            frame_embeddings = [torch.tensor(emb, dtype=torch.float32) for emb in group_sorted['embedding'].tolist()]
+            frame_indices = group_sorted['frame_index'].tolist()
             
             actual_frames = len(frame_embeddings)
             if actual_frames < num_frames:
@@ -479,9 +559,12 @@ class LanceDBVideoIndex:
             V_embs_list.append(video_embedding)
         
         V_embs = torch.stack(V_embs_list)  # [video_num, num_frames, embedding_dim]
+        
+        patch_weights = self._get_patch_weights(num_frames, similarity_type)
+        
         # TODO: frame mask?
         # [num_queries, video_num] or [video_num] (for single query)
-        similarities = self._calculate_batched_similarity(query_emb_flat, V_embs, None, similarity_type, query_token_nums)
+        similarities = self._calculate_batched_similarity(query_emb_flat, V_embs, None, similarity_type, query_token_nums, patch_weights)
 
         video_similarities = {}
         for video_path in video_paths:
@@ -631,7 +714,6 @@ class LanceDBVideoIndex:
             if video_path in video_paths_in_results:
                 filtered_similarities[video_path] = similarity_data
         
-        # TODO: check the order of queries
         num_queries = 1 if query_token_nums is None else len(query_token_nums)
         
         query_results = {}
@@ -673,10 +755,11 @@ class LanceDBVideoIndex:
         
         return query_results
     
-    def _calculate_batched_similarity(self, query_emb: torch.Tensor, V_embs: torch.Tensor, frame_masks = None, similarity_type = None, query_token_nums: List[int] = None):
+    def _calculate_batched_similarity(self, query_emb: torch.Tensor, V_embs: torch.Tensor, frame_masks = None, similarity_type = None, query_token_nums: List[int] = None, patch_weights: torch.Tensor = None):
         """
         query_emb: [total_query_tokens, embedding_dim]
         V_embs: [video_num, frame_num, embedding_dim]
+        patch_weights: [frame_num] tensor with weights for each patch/raw image (for weighted similarity functions)
         """
         if similarity_type not in SIMILARITY_FUNCTIONS:
             raise ValueError(f"Unknown similarity type: {similarity_type}. Available types: {list(SIMILARITY_FUNCTIONS.keys())}")
@@ -684,17 +767,24 @@ class LanceDBVideoIndex:
         similarity_func = SIMILARITY_FUNCTIONS[similarity_type]
         
         video_num, frame_num, embedding_dim = V_embs.shape
+        
         if frame_masks is not None:
             # TODO: not implemented now
             V_embs_flat = V_embs.view(-1, embedding_dim) 
             valid_frames = frame_masks.view(-1) 
             V_embs_valid = V_embs_flat[valid_frames] 
-            similarities = similarity_func(query_emb, V_embs_valid, query_token_nums, video_num)
+            if patch_weights is not None:
+                similarities = similarity_func(query_emb, V_embs_valid, query_token_nums, video_num, patch_weights)
+            else:
+                similarities = similarity_func(query_emb, V_embs_valid, query_token_nums, video_num)
         else:
             # TODO: confirm the video order keeps unchanged during resahpe process
             # [video_num, frame_num, embedding_dim] -> [video_num * frame_num, embedding_dim]
             V_embs_flat = V_embs.view(-1, embedding_dim) 
-            similarities = similarity_func(query_emb, V_embs_flat, query_token_nums, video_num)
+            if patch_weights is not None:
+                similarities = similarity_func(query_emb, V_embs_flat, query_token_nums, video_num, patch_weights)
+            else:
+                similarities = similarity_func(query_emb, V_embs_flat, query_token_nums, video_num)
         
         # The similaritiese shape:
         # Single query: [video_num]
@@ -743,6 +833,9 @@ class LanceDBVideoRetriever:
         self.encoder_config = get_encoder_config(encoder_type)
         print(f"LanceDB video retrieval system initialized with {max_frames_per_video} frames per video (encoder: {encoder_type}).")
         print(f"Available similarity methods: {self.encoder_config['similarity_methods']}")
+
+    def set_patch_weights(self, patch_weights):
+        self.index.set_patch_weights(patch_weights)
 
     def set_encoder(self, encoder):
         self.encoder = encoder

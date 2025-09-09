@@ -1,0 +1,3 @@
+[submodule "models/VLM2Vec"]
+	path = models/VLM2Vec
+	url = https://github.com/TIGER-AI-Lab/VLM2Vec.git
