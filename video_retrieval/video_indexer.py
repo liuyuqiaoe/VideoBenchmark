@@ -9,7 +9,6 @@ from pathlib import Path
 import json
 import pickle
 import time
-import json
 from datetime import datetime
 import lancedb
 from lancedb.pydantic import Vector, LanceModel
@@ -613,7 +612,7 @@ class LanceDBVideoIndex:
         results = self._search_with_similarity(query_embedding, query_token_nums, top_k_list, where_clause, return_all, similarity_type)
         # results = {
         #     query_idx: [
-        #         (video_path, similarity, metadata),
+        #         (video_path, similarity, video_index, rank),
         #         ...
         #     ],...
         # }
@@ -625,7 +624,7 @@ class LanceDBVideoIndex:
         for query_idx, query_results_list in results.items():
             formatted_results = []
        
-            for video_path, similarity, video_index in query_results_list:
+            for video_path, similarity, video_index, rank in query_results_list:
                 metadata = {
                     "video_path": video_path,
                     "video_name": os.path.basename(video_path).rsplit('.', 1)[0],
@@ -642,7 +641,7 @@ class LanceDBVideoIndex:
                     "query_text": queries[query_idx] if query_idx < len(queries) else f"query_{query_idx}",
                     "query_index": query_idx
                 }
-                formatted_results.append((video_path, similarity, metadata))
+                formatted_results.append((video_path, similarity, rank, metadata))
             query_results[query_idx] = formatted_results
      
             # query_results = {
@@ -655,7 +654,7 @@ class LanceDBVideoIndex:
         
         return query_results
     
-    def search_clean(self, query_embedding: np.ndarray, queries, query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause: str = " ", return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None):
+    def search_clean(self, query_embedding: np.ndarray, queries, query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause: str = " ", return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None, return_gt = []):
         
         if similarity_type is None and encoder_config is not None:
             similarity_type = encoder_config["default_similarity"]
@@ -674,20 +673,20 @@ class LanceDBVideoIndex:
                 raise ValueError(f"Length of top_k list ({len(top_k)}) must match number of queries ({num_queries})")
             top_k_list = top_k
         
-        results = self._search_with_similarity(query_embedding, query_token_nums, top_k_list, where_clause, return_all, similarity_type)
+        results = self._search_with_similarity(query_embedding, query_token_nums, top_k_list, where_clause, return_all, similarity_type, return_gt)
         
         query_results = {}
         
         for query_idx, query_results_list in results.items():
             formatted_results = []
-            for video_path, similarity, video_index in query_results_list:
-                formatted_results.append((video_path, similarity))
+            for video_path, similarity, video_index, rank in query_results_list:
+                formatted_results.append((video_path, similarity, rank))
             query_results[query_idx] = formatted_results
             
         return query_results
 
 
-    def _search_with_similarity(self, query_embedding: np.ndarray, query_token_nums: List[int] = None, top_k: List[int] = None, where_clause = [], return_all = False, similarity_type = None):
+    def _search_with_similarity(self, query_embedding: np.ndarray, query_token_nums: List[int] = None, top_k: List[int] = None, where_clause = [], return_all = False, similarity_type = None, return_gt = []):
         if return_all:
             results = self.table.to_pandas()
         elif not where_clause:  
@@ -734,22 +733,49 @@ class LanceDBVideoIndex:
                 reverse=True
             )
             
-            if not return_all:
+            search_results = []
+            if (not return_all) and (not return_gt):
                 sorted_videos = sorted_videos[:top_k[query_idx]]
             
-            search_results = []
-            for video_path, video_data in sorted_videos:
-                search_results.append((
-                    video_path,
-                    video_data['similarity'],
-                    video_data['video_index']
-                ))
+            # TODO: add return_gt and rank
+            if not return_gt:
+                for rank, (video_path, video_data) in enumerate(sorted_videos):
+                    search_results.append((
+                        video_path,
+                        video_data['similarity'],
+                        video_data['video_index'],
+                        rank
+                    ))
+            else:
+                return_gt_query = return_gt[query_idx]
+                for rank, (video_path, video_data) in enumerate(sorted_videos):
+                    video_id = os.path.basename(video_path)
+                    if rank < top_k[query_idx]:
+                        search_results.append((
+                            video_path,
+                            video_data['similarity'],
+                            video_data['video_index'],
+                            rank
+                        ))
+                        if video_id in return_gt_query:
+                            return_gt_query.remove(video_id)
+                    elif return_gt_query:
+                        if video_id in return_gt_query:
+                            search_results.append((
+                                video_path,
+                                video_data['similarity'],
+                                video_data['video_index'],
+                                rank
+                            )) 
+                            return_gt_query.remove(video_id)
+                    else:
+                        break
             
             query_results[query_idx] = search_results
-        
+            
         # query_results = {
         #     query_idx: [
-        #         (video_path, similarity, video_index)
+        #         (video_path, similarity, video_index, rank)
         #     ],...
         # }
         
@@ -1047,7 +1073,7 @@ class LanceDBVideoRetriever:
         )
         # results = {
         #     query_idx: [
-        #         (video_path, similarity, metadata),
+        #         (video_path, similarity, metadata, rank),
         #         ...
         #     ],
         #     ...
@@ -1090,7 +1116,10 @@ class LanceDBVideoRetriever:
         else:
             query_embeddings = []
             for query in queries:
-                query_emb = self.encoder.encode_text(query) # torch.float16 tensor: [sentence_num, embedding_dim]
+                if hasattr(self.encoder, "encode_texts"):
+                    query_emb = self.encoder.encode_texts(query) # torch.float16 tensor: [sentence_num, embedding_dim]
+                else:
+                    query_emb = self.encoder.encode_text(query)
                 
                 if query_emb is None:
                     print("Failed to encode queries")
@@ -1178,55 +1207,12 @@ class LanceDBVideoRetriever:
         
         return results
     
-    def search_image(self, images, top_k = 5, where_clause = " ", return_all = False, similarity_type = None):
-        if not self.encoder:
-            print("No encoder, please set an encoder.")
-            return {}
-        
+    def search_image(self, images, top_k = 5, where_clause = " ", return_all = False, similarity_type = None, return_gt = []):
         if isinstance(images, Image.Image):
             images = [images]
         
-        if not images:
-            print("No images provided.")
-            return {}
-        
-        # TODO: internvideo2 encode texts by batch
-        if self.encoder_type == "internvideo2":
-            # encode each query separately and concatenate
-            query_embeddings = []
-            for query in queries:
-                query_emb = self.encoder.encode_text(query)
-                if query_emb.dim() == 3:
-                    query_emb = query_emb.squeeze(0)
-                if query_emb is not None:
-                    query_embeddings.append(query_emb)
-
-            if not query_embeddings:
-                print("Failed to encode any queries")
-                return {}
-
-            query_embedding = torch.cat(query_embeddings, dim=0)  # torch.bfloat16 tensor: [query_num, num_tokens, embedding_dim]
-            query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
-            query_token_nums = [emb.shape[0] for emb in query_embeddings]  # List of token counts per query
-        else:
-            # encode all queries at once
-            batch_size = 3
-            batch_max = ((len(images) -1) // batch_size) + 1
-            img_embs = []
-            for batch_idx in tqdm(range(batch_max)):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size - 1, len(images)-1)
-                batch_img_embs = self.encoder.encode_image(images[start_idx:end_idx+1])
-                if batch_img_embs.dim() == 1:
-                    batch_img_embs.unsqueeze(0)
-                img_embs.append(batch_img_embs)
-                del batch_img_embs
-                
-            query_embedding = torch.cat(img_embs, dim=0) # torch.float16 tensor: [query_num, embedding_dim]
-            if query_embedding is None:
-                print("Failed to encode queries")
-                return {}
-            query_token_nums = [1] * len(images)  
+        query_embedding = self.encoder.encode_images(images)
+        query_token_nums = [1] * len(images)  
         
         if query_embedding is None:
             print("Failed to encode images")
@@ -1241,7 +1227,8 @@ class LanceDBVideoRetriever:
             return_all, 
             similarity_type, 
             self.encoder_type, 
-            self.encoder_config
+            self.encoder_config,
+            return_gt
         )
         
         return results
@@ -1255,9 +1242,9 @@ class LanceDBVideoRetriever:
         
         for query_idx, query_results in results.items():
             query_data = []
-            for i, (video_path, similarity, metadata) in enumerate(query_results):
+            for i, (video_path, similarity, rank, metadata) in enumerate(query_results):
                 result_entry = {
-                    "rank": i + 1,
+                    "rank": rank,
                     "video_path": video_path,
                     "similarity": float(similarity), 
                     "metadata": {
@@ -1290,7 +1277,7 @@ class LanceDBVideoRetriever:
         
         for query_idx, query_results in results.items():
             query_data = []
-            for i, (video_path, similarity, metadata) in enumerate(query_results):
+            for i, (video_path, similarity, rank, metadata) in enumerate(query_results):
                 query_data.append(video_path)
             query_text = metadata.get("query_text", f"query_{query_idx}") if query_results else f"query_{query_idx}"
             pure_data[query_idx] = {

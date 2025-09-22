@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 
-def select_images(k, train_split_dir, output_path):
+def select_images(k, train_split_dir, output_path, label_filtering=None):
     action_to_images = {}
     img_extensions = {"jpg", "jpeg"}
     for root, dirs, files in os.walk(train_split_dir):
@@ -23,8 +23,12 @@ def select_images(k, train_split_dir, output_path):
                 action_to_images[action] = action_lst + [img_path]
 
     selected_images = {}
+
     for action, imgs in action_to_images.items():
         selected_images[action] = random.sample(imgs, k=k)
+
+    if label_filtering:
+        selected_images = {k: selected_images[k] for k in label_filtering}
 
     with open(output_path, "w") as f:
         json.dump(selected_images, f, indent=2)
@@ -32,6 +36,7 @@ def select_images(k, train_split_dir, output_path):
     print(f"Dumped {len(action_to_images)} actions to path ")
     return action_to_images
 
+# copied from others' work
 def creating_dataset():
     dataset_dir = os.path.join(os.getcwd(), "Stanford40Actions")
     images_path = dataset_dir + "/JPEGImages"
@@ -164,14 +169,15 @@ if __name__ == "__main__":
     # select_images(10, "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train", "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/selected_images.json")
     # create_image_batches(batch_size=128, images_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/JPEGImages", output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_28_experiments/results/s40a/image_batches.json")
     # output = get_image_batches("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_28_experiments/results/s40a/image_batches.json", start_idx=0, end_idx=2)
-    with open("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json", "r") as f:
-        data = json.load(f)
-    qa_pairs = data["qa_pairs"]
-    questions = [q["question"] for q in qa_pairs]
-    for i, question in enumerate(questions):
-        r = parse_phrases(question)
-        if len(r) != 5:
-            print(i)
-            print(r)
+    
+    sampled_label_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_16_experiments/results/label_split_basedon_query_nopatches/label_sampled5.json"
+    output_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_16_experiments/results/label_split_basedon_query_nopatches/selected_images.json"
+    with open(sampled_label_path, "r") as f:
+        content = json.load(f)
+    labels = []
+    for k, v in content.items():
+        labels += v
+    select_images(k=40, train_split_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train", output_path=output_path, label_filtering=labels)
+    
     
  

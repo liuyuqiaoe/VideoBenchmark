@@ -80,22 +80,29 @@ def get_10_25_50(origin_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/
     with open(origin_path, "r") as f:
         data = json.load(f)
     l_to_q_hr = {}
+    total_hr_10_25_50_100 = []
     for q in data:
         l_lst = l_to_q_hr.get(q["gt_action"], [])
         n10, n25, n50 = int(0.1*q["gt_num"]), int(0.25*q["gt_num"]), int(0.5*q["gt_num"])
-        hit = [1 if item["action_actegory"] == q["gt_action"] else 0 for item in q["items"]]
-        
+        n100 = q["gt_num"]
+        hit = [1 if item["action_category"] == q["gt_action"] else 0 for item in q["items"]]
+        hr_10_25_50_100 = [sum(hit[:n10])/n10, sum(hit[:n25])/n25, sum(hit[:n50])/n50, sum(hit)/n100]
+        total_hr_10_25_50_100.append(hr_10_25_50_100)
         content = {
             "question": q["question"],
-            "n_10_25_50": [n10, n25, n50],
-            "hr10": sum(hit[:n10])/n10,
-            "hr25": sum(hit[:n25])/n25,
-            "hr50": sum(hit[:n50])/n50
+            "n_10_25_50_100": [n10, n25, n50, n100],
+            "hr_10_25_50_100": hr_10_25_50_100
         }
         l_lst.append(content)
         l_to_q_hr[q["gt_action"]] = l_lst
+    total_hr_10_25_50_100_mat = np.array(total_hr_10_25_50_100)
+    total_hr_10_25_50_100 = total_hr_10_25_50_100_mat.mean(axis=0).tolist()
+    result = {
+        "total_hr_10_25_50_100": total_hr_10_25_50_100,
+        "content": l_to_q_hr
+        }
     with open(output_path, "w") as f:
-        json.dump(l_to_q_hr, f, indent=2)
+        json.dump(result, f, indent=2)
 
 def get_hitrate_ks(origin_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_3_experiments/results/llava_s40a_multi_phrase_none_colbert_tml5/origin/llava_s40a_multi_phrase_none_colbert_tml5_origin.json", output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_3_experiments/results/llava_s40a_multi_phrase_none_colbert_tml5/origin/llava_s40a_multi_phrase_none_colbert_tml5_hr_ks.json", k_lst=[1, 2, 3, 5, 10, 20]):
     with open(origin_path, "r") as f:
@@ -164,17 +171,22 @@ def get_hitrate_ks_analysis(hitrate_ks_file, output_path):
 
     with open(output_path, "w") as f:
         json.dump(final_result, f, indent=2)
-    
+
+def split_labels_by_hr(hr_ks_analysis_file, output_path):
+        
 if __name__ == "__main__":
     # concat_results("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_28_experiments/results/ucf101_multi_desc_llava/origin")
     # get_action_mam()
-    # concat_origin("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_6_experiments/results/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean/origin", "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_6_experiments/results/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean/origin/origin.json")
-    # get_10_25_50()
+    # concat_origin(
+    #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin", 
+    #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/origin.json"
+    #     )
     # get_hitrate_ks(
-    #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_6_experiments/results/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean/origin/origin.json",
-    #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_6_experiments/results/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean/origin/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_hr_ks.json.json"
+    #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/origin.json",
+    #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean_hr_ks.json"
     # )
-    get_hitrate_ks_analysis(
-        hitrate_ks_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_6_experiments/results/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean/origin/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_hr_ks.json.json",
-        output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/9_6_experiments/results/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean/origin/llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_final_results.json.json"
-        )
+    # get_hitrate_ks_analysis(
+    #     hitrate_ks_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean_hr_ks.json",
+    #     output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean_final_results.json"
+    #     )
+    get_10_25_50(origin_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_12_experiments/results/ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean_0_40.json", output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_12_experiments/results/ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean_hr102550.json")

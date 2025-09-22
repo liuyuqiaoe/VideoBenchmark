@@ -1,12 +1,18 @@
 import json
 import os
 from typing import Dict, List, Any, Optional, Callable
-from video_retrieval.encoders.intern_video2_encoder import InternVideo2Encoder
-from video_retrieval.encoders.e5v_encoder import E5VVideoEncoder
+# from video_retrieval.encoders.intern_video2_encoder import InternVideo2Encoder
+# from video_retrieval.encoders.e5v_encoder import E5VVideoEncoder
 from video_retrieval.encoders.llava_qwen_encoder import LLaVAQwenEncoder
+# from video_retrieval.encoders.vlm2vec_encoder import VLM2VecEncoder
 from tqdm import tqdm
+from PIL import Image
+import copy
 from video_retrieval.video_indexer import LanceDBVideoIndex, LanceDBVideoRetriever
+from video_retrieval.stanford40action.utils import parse_phrases
 
+import warnings
+warnings.filterwarnings('ignore')
 
 class UFC101QADataset:
     def __init__(self, dataset_path: str):
@@ -44,6 +50,44 @@ class UFC101QADataset:
     
     def get_vqa_pairs(self):
         return self.dataset.get("vqa_pairs", [])
+    
+    def get_10descriptions_test(self):
+        action_to_query = {}
+        actions = set()
+        for qa_pair in self.qa_pairs:
+            if qa_pair["action"] in actions:
+                action_to_query[qa_pair["action"]]["question"].append(qa_pair["question"])
+            else:
+                actions.add(qa_pair["action"])
+                action_to_query[qa_pair["action"]] = {key: value for key, value in qa_pair.items()}
+                action_to_query[qa_pair["action"]]["question"] = [qa_pair["question"]]
+               
+        new_qa_pairs = list(action_to_query.values())
+        return new_qa_pairs
+    
+    def get_multi_phrase_vqa_pairs(self):
+        for qa_pair in self.qa_pairs:
+            response = qa_pair["question"]
+            phrases = parse_phrases(response)
+            qa_pair["question"] = phrases
+        return self.qa_pairs
+    
+    def get_10descriptions_s40a(self):
+        img_id_to_query = {}
+        img_ids = set()
+        for qa_pair in self.qa_pairs:
+            ans = qa_pair["answer"]
+            if ans in img_ids:
+                img_id_to_query[ans]["question"].append(qa_pair["question"])
+            else:
+                img_ids.add(ans)
+                img_id_to_query[ans] = {key: value for key, value in qa_pair.items()}
+                img_id_to_query[ans]["question"] = [qa_pair["question"]]
+        
+        new_qa_pairs = list(img_id_to_query.values())
+        return new_qa_pairs
+
+
 
     # qa
     def get_idx_qa_mapping(self):
@@ -59,14 +103,17 @@ class UFC101QADataset:
         return qas, qa_to_idx
 
 class DatasetTester:
-    def __init__(self, db_path, encoder, similarity_type=None):
+    def __init__(self, db_path=None, encoder=None, similarity_type=None, table_name="video_embeddings"):
         self.db_path = db_path
         self.encoder = encoder
-        self.similarity_type = similarity_type
-        self.retriever = LanceDBVideoRetriever(encoder=self.encoder, db_path=self.db_path)
+        self.similarity_type = similarity_type if similarity_type else "cosine_max_mean"
+        self.retriever = LanceDBVideoRetriever(encoder=self.encoder, db_path=self.db_path, table_name=table_name)
 
     def load_encoder(self):
         pass
+
+    def set_patch_weights(self, patch_weights):
+        self.retriever.set_patch_weights(patch_weights)
 
     def test_dataset(
         self, 
@@ -158,28 +205,139 @@ class DatasetTester:
         ans_path = " ", 
         return_all = False,
         where_clause = False,
-        only_label = False
+        only_label = False,
     ):  
+        
         qa_pairs = getattr(dataset, "qa_pairs", getattr(dataset, 'vqa_pairs', None))
         query_to_idx = {}
         qs  = []
+        gt_action = []
         topk = 0
         topk_lst = []
         for idx, qa_pair in enumerate(qa_pairs):
             query_to_idx[qa_pair["question"]] = idx
             qs.append(qa_pair["question"])
-            topk = max(topk, qa_pair["video_count"])
+            gt_action_single = qa_pair["action"]
+            gt_action.append(f"action_category = '{gt_action_single}")
+            # topk = max(topk, qa_pair["video_count"])
             topk_lst.append(qa_pair["video_count"])
 
-        batch_size = 100
-        total_batch = (len(qs) -1) // batch_size + 1
-        ans = []
-        ans_file = []
-    
+        batch_size = 55
+        total_batch = ((len(qs) -1) // batch_size) + 1
+        ans_paths = []
         for batch_idx in tqdm(range(total_batch)):
             start = batch_idx * batch_size
             end = min(start + batch_size - 1, len(qa_pairs))
             ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
+            qs_batch = qs[start:end+1]
+            topk_lst_batch = topk_lst[start:end+1]
+            if where_clause:
+                results_multi_queries = self.retriever.search(
+                    queries=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type,
+                    where_clause=None # gt_action
+                )
+            else:
+                results_multi_queries = self.retriever.search(
+                    queries=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type
+                )
+                
+            results_multi_queries = self.retriever.formated_results(results_multi_queries)    
+            
+            ans_file = []
+            # self.retriever.dump_results(results_multi_queries,ans_path_batch)
+            for query_idx, query_result in results_multi_queries.items():
+                hit = 0
+                similarities = []
+                retrieved_video_ids = []
+                items = []
+                results = query_result["results"]
+                question = query_result["query_text"]
+                question_idx = query_to_idx[question]
+                qa_pair = qa_pairs[question_idx]
+                gt_num = qa_pair["video_count"]
+                for i, result in enumerate(results):
+                    retrieved_video_ids.append(result["metadata"]["video_name"])
+                    item = {
+                        "video_id": result["metadata"]["video_name"],
+                        "similarity": result["similarity"],
+                        "rank": result["rank"],
+                        "search_time": result["metadata"]["search_time"],
+                        "action_actegory": result["metadata"]["action_category"],
+                        "video_index": result["metadata"]["video_index"],
+                        "encoder_type": result["metadata"]["encoder_type"],
+                        "embedding_dim": result["metadata"]["embedding_dim"],
+                        "similarity_type": result["metadata"]["similarity_type"],
+                        "query_embedding_shape": result["metadata"]["query_embedding_shape"],
+                        "video_embedding_shape": result["metadata"]["video_embedding_shape"]
+                    }
+                    items.append(item)
+                    similarities.append(result["similarity"])
+
+                    if i < gt_num and result["metadata"]["action_category"].strip().lower() == qa_pair["action"].strip().lower():
+                        hit += 1
+
+                ans = {
+                    "question_idx": question_idx,
+                    "question": question,
+                    "gt_video_ids": qa_pair["video_ids"],
+                    "gt_num": gt_num,
+                    "gt_action": qa_pair["action"],
+                    "retrieved_video_ids": retrieved_video_ids,
+                    "retrieved_num": len(results),
+                    "items": items,
+                    "avg_similarity": sum(similarities) / len(retrieved_video_ids) if retrieved_video_ids else 0,
+                    "max_similarity": max(similarities) if similarities else 0,
+                    "min_similarity": min(similarities) if similarities else 0,
+                    "hit": hit
+                }
+                ans_file.append(ans)
+            
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
+                json.dump(ans_file, f, indent=2, ensure_ascii=False)
+            
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
+
+        if return_all:
+            for ans_path in ans_paths:
+                get_gt(ans_path)
+
+        return ans_paths
+
+    def test_dataset_batch_query_s40a(
+        self, 
+        dataset: UFC101QADataset, 
+        ans_path = " ", 
+        return_all = False,
+        where_clause = False,
+        only_label = False,
+    ):  
+        
+        qa_pairs = getattr(dataset, "qa_pairs", getattr(dataset, 'vqa_pairs', None))
+        query_to_idx = {}
+        qs  = []
+        topk_lst = []
+        for idx, qa_pair in enumerate(qa_pairs):
+            query_to_idx[qa_pair["question"]] = idx
+            qs.append(qa_pair["question"])
+            topk_lst.append(qa_pair["image_count"])
+            # topk_lst.append(20)
+
+        batch_size = 50
+        total_batch = (len(qs) -1) // batch_size + 1
+        ans_paths = []
+        for batch_idx in tqdm(range(total_batch)):
+            start = batch_idx * batch_size
+            end = min(start + batch_size - 1, len(qa_pairs))
+            ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
             qs_batch = qs[start:end+1]
             topk_lst_batch = topk_lst[start:end+1]
             if self.similarity_type:
@@ -197,6 +355,7 @@ class DatasetTester:
                 )
             results_multi_queries = self.retriever.formated_results(results_multi_queries)    
             
+            ans_file = []
             # self.retriever.dump_results(results_multi_queries,ans_path_batch)
             for query_idx, query_result in results_multi_queries.items():
                 hit = 0
@@ -206,6 +365,218 @@ class DatasetTester:
                 results = query_result["results"]
                 question = query_result["query_text"]
                 question_idx = query_to_idx[question]
+                qa_pair = qa_pairs[question_idx]
+                gt_num = qa_pair["image_count"]
+                for i, result in enumerate(results):
+                    retrieved_video_ids.append(result["metadata"]["video_name"])
+                    item = {
+                        "image_id": result["metadata"]["video_name"],
+                        "similarity": result["similarity"],
+                        "rank": result["rank"],
+                        "search_time": result["metadata"]["search_time"],
+                        "action_category": result["metadata"]["video_name"].rsplit("_", 1)[0].strip(),
+                        "image_index": result["metadata"]["video_index"],
+                        "encoder_type": result["metadata"]["encoder_type"],
+                        "embedding_dim": result["metadata"]["embedding_dim"],
+                        "similarity_type": result["metadata"]["similarity_type"],
+                        "query_embedding_shape": result["metadata"]["query_embedding_shape"],
+                        "video_embedding_shape": result["metadata"]["video_embedding_shape"]
+                    }
+                    items.append(item)
+                    similarities.append(result["similarity"])
+
+                    if i < gt_num and result["metadata"]["action_category"].strip().lower() == qa_pair["action"].strip().lower():
+                        hit += 1
+
+                ans = {
+                    "question_idx": question_idx,
+                    "question": question,
+                    "gt_image_ids": qa_pair["image_ids"],
+                    "gt_num": qa_pair["image_count"],
+                    "gt_action": qa_pair["action"],
+                    "retrieved_image_ids": retrieved_video_ids,
+                    "retrieved_num": len(results),
+                    "items": items,
+                    "avg_similarity": sum(similarities) / len(retrieved_video_ids) if retrieved_video_ids else 0,
+                    "max_similarity": max(similarities) if similarities else 0,
+                    "min_similarity": min(similarities) if similarities else 0,
+                    "hit": hit
+                }
+                ans_file.append(ans)
+            
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
+                json.dump(ans_file, f, indent=2, ensure_ascii=False)
+        
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
+        
+        if return_all:
+            for ans_path in ans_paths:
+                # get_gt_image(ans_path)
+                get_gt_image_by_query(ans_path)
+
+        return ans_paths
+    
+    def test_dataset_batch_query_merge_desc_s40a(
+        self, 
+        dataset: UFC101QADataset, 
+        ans_path = " ", 
+        return_all = False,
+        where_clause = False,
+        only_label = False,
+    ):  
+        
+        qa_pairs = dataset.get_10descriptions_test()
+        # qa_pairs = dataset.get_multi_phrase_vqa_pairs()
+        # qa_pairs = dataset.get_10descriptions_s40a()
+        qs  = []
+        topk_lst = []
+        for idx, qa_pair in enumerate(qa_pairs):
+            qs.append(qa_pair["question"])
+            topk_lst.append(qa_pair["image_count"])
+            # topk_lst.append(20)
+
+        batch_size = 50
+        total_batch = ((len(qs) -1) // batch_size) + 1
+        ans_paths = []
+        for batch_idx in tqdm(range(total_batch)):
+            start = batch_idx * batch_size
+            end = min(start + batch_size - 1, len(qa_pairs))
+            ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
+            qs_batch = qs[start:end+1]
+            topk_lst_batch = topk_lst[start:end+1]
+            if self.similarity_type:
+                results_multi_queries = self.retriever.search_10descriptions_test(
+                    queries=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type
+                )
+            else:
+                results_multi_queries = self.retriever.search_10descriptions_test(
+                    queries=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all
+                )
+            results_multi_queries = self.retriever.formated_results(results_multi_queries)    
+            
+            ans_file = []
+            # self.retriever.dump_results(results_multi_queries,ans_path_batch)
+            for query_idx, query_result in results_multi_queries.items():
+                hit = 0
+                similarities = []
+                retrieved_video_ids = []
+                items = []
+                results = query_result["results"]
+                question = query_result["query_text"]
+                question_idx = query_idx + start
+                qa_pair = qa_pairs[question_idx]
+                gt_num = qa_pair["image_count"]
+                for i, result in enumerate(results):
+                    retrieved_video_ids.append(result["metadata"]["video_name"])
+                    item = {
+                        "image_id": result["metadata"]["video_name"],
+                        "similarity": result["similarity"],
+                        "rank": result["rank"],
+                        "search_time": result["metadata"]["search_time"],
+                        "action_category": result["metadata"]["video_name"].rsplit("_", 1)[0].strip(),
+                        "image_index": result["metadata"]["video_index"],
+                        "encoder_type": result["metadata"]["encoder_type"],
+                        "embedding_dim": result["metadata"]["embedding_dim"],
+                        "similarity_type": result["metadata"]["similarity_type"],
+                        "query_embedding_shape": result["metadata"]["query_embedding_shape"],
+                        "video_embedding_shape": result["metadata"]["video_embedding_shape"]
+                    }
+                    items.append(item)
+                    similarities.append(result["similarity"])
+
+                    if i < gt_num and result["metadata"]["action_category"].strip().lower() == qa_pair["action"].strip().lower():
+                        hit += 1
+
+                ans = {
+                    "question_idx": question_idx,
+                    "question": question,
+                    "gt_image_ids": qa_pair["image_ids"],
+                    "gt_num": qa_pair["image_count"],
+                    "gt_action": qa_pair["action"],
+                    "retrieved_image_ids": retrieved_video_ids,
+                    "retrieved_num": len(results),
+                    "items": items,
+                    "avg_similarity": sum(similarities) / len(retrieved_video_ids) if retrieved_video_ids else 0,
+                    "max_similarity": max(similarities) if similarities else 0,
+                    "min_similarity": min(similarities) if similarities else 0,
+                    "hit": hit
+                }
+                ans_file.append(ans)
+            
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
+                json.dump(ans_file, f, indent=2, ensure_ascii=False)
+        
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
+        
+        if return_all:
+            for ans_path in ans_paths:
+                get_gt_image(ans_path)
+
+        return ans_paths
+
+    def test_dataset_batch_query_merge_description(
+        self, 
+        dataset: UFC101QADataset, 
+        ans_path = " ", 
+        return_all = False,
+        where_clause = False,
+        only_label = False,
+    ):  
+        
+        qa_pairs = dataset.get_10descriptions_test()
+        label_to_idx = {}
+        qs  = []
+        topk = 0
+        topk_lst = []
+        for idx, qa_pair in enumerate(qa_pairs):
+            label_to_idx[qa_pair["action"]] = idx
+            qs.append(qa_pair["question"])
+            topk = max(topk, qa_pair["video_count"])
+            topk_lst.append(qa_pair["video_count"])
+
+        batch_size = 55
+        total_batch = (len(qs) -1) // batch_size + 1
+        ans_paths = []
+        for batch_idx in tqdm(range(total_batch)):
+            start = batch_idx * batch_size
+            end = min(start + batch_size - 1, len(qa_pairs))
+            ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
+            qs_batch = qs[start:end+1]
+            topk_lst_batch = topk_lst[start:end+1]
+            if self.similarity_type:
+                results_multi_queries = self.retriever.search_10descriptions_test(
+                    queries=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type
+                )
+            else:
+                results_multi_queries = self.retriever.search_10descriptions_test(
+                    queries=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all
+                )
+            results_multi_queries = self.retriever.formated_results(results_multi_queries)    
+            
+            ans_file = []
+            # self.retriever.dump_results(results_multi_queries,ans_path_batch)
+            for query_idx, query_result in results_multi_queries.items():
+                hit = 0
+                similarities = []
+                retrieved_video_ids = []
+                items = []
+                results = query_result["results"]
+                question = query_result["query_text"]
+                question_idx = query_idx + start
                 qa_pair = qa_pairs[question_idx]
                 gt_num = qa_pair["video_count"]
                 for i, result in enumerate(results):
@@ -245,55 +616,217 @@ class DatasetTester:
                 }
                 ans_file.append(ans)
             
-            with open(ans_path, "w", encoding='utf-8') as f:
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
                 json.dump(ans_file, f, indent=2, ensure_ascii=False)
         
-        print(f"Results dumped to: {ans_path}")
-        print(f"Total queries: {len(ans_file)}")
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
 
-        return ans_path
+        if return_all:
+            for ans_path in ans_paths:
+                get_gt(ans_path)
 
-    def get_score(self, ans_file = " "):
-        with open(ans_file, "r") as f:
-            answers = json.load(f)
+        return ans_paths
+
+    def test_dataset_batch_image_query_desc_s40a(
+        self, 
+        dataset: UFC101QADataset, 
+        ans_path = " ", 
+        return_all = False,
+        where_clause = False,
+        only_label = False,
+        images_dir = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train",
+        return_gt = True
+    ):  
         
-        results = []
+        qa_pairs = dataset.qa_pairs
+        qs, topk_lst, return_gt_lst  = [], [], []
 
-        for ans in answers:
-            gt_num = ans["gt_num"]
-            gt_video_ids = set(ans["gt_video_ids"])
-            retrieved_video_ids = ans["retrieved_video_ids"]
-            retrieved_num = ans["retrieved_num"]
-            hit_by_id = 0
+        for idx, qa_pair in enumerate(qa_pairs):
+            q_image_path = qa_pair["action"] + "/" + qa_pair["question"]
+            q_image_path = os.path.join(images_dir, q_image_path)
+            q_image = Image.open(q_image_path).convert("RGB")
+            qs.append(q_image)
+            topk_lst.append(100)
+            gt_lst = copy.deepcopy(qa_pair["image_ids"])
+            return_gt_lst.append(gt_lst)
+
+        if not return_gt:
+            return_gt_lst = []
+
+        batch_size = 50
+        total_batch = ((len(qs) -1) // batch_size) + 1
+        ans_paths = []
+        for batch_idx in tqdm(range(total_batch)):
+            start = batch_idx * batch_size
+            end = min(start + batch_size - 1, len(qa_pairs))
+            ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
+            qs_batch = qs[start:end+1]
+            topk_lst_batch = topk_lst[start:end+1]
+            if self.similarity_type:
+                results_multi_queries = self.retriever.search_image(
+                    images=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type,
+                    return_gt = return_gt_lst
+                )
+            else:
+                results_multi_queries = self.retriever.search_image(
+                    images=qs_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    return_gt = return_gt_lst
+                )
             
-            for i, v in enumerate(retrieved_video_ids):
-                if i < gt_num and (v in gt_video_ids):
-                    hit_by_id += 1
-                    gt_video_ids.remove(v)
+            ans_file = []
             
-            clean_result = {
-                "Question": ans["question"],
-                "gt_num": gt_num,
-                "hit_rate": hit_by_id / gt_num if gt_num > 0 else 0,
-                "avg_similarity": ans["avg_similarity"],
-                "max_similarity": ans["max_similarity"],
-                "min_similarity": ans["min_similarity"]
-            }
-            results.append(clean_result)
-        
-        ans_file_root = os.path.dirname(ans_file)
-        result_file_name = os.path.basename(ans_file).split(".")[0] + "_results.json"
-        results_path = os.path.join(ans_file_root, result_file_name)
-        
-        with open(results_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        
-        return results_path
+            for query_idx, query_result in results_multi_queries.items():
+                hit = 0
+                similarities = []
+                retrieved_ids = []
+                items = []
+                question_idx = query_idx + start
+                qa_pair = qa_pairs[question_idx]
+                gt_num = qa_pair["image_count"]
+                for i, (image_path, similarity, rank) in enumerate(query_result):
+                    image_id = os.path.basename(image_path)
+                    retrieved_ids.append(image_id)
+                    item = {
+                        "image_id": image_id,
+                        "similarity": similarity,
+                        "rank": rank,
+                        "action_category": image_id.rsplit("_", 1)[0].strip(),
+                    }
+                    items.append(item)
+                    similarities.append(similarity)
 
+                    if i < gt_num and (image_id in qa_pair["image_ids"]):
+                        hit += 1
 
-def run_test_configurations(config, db_path, encoder, similarity_type):
-    tester = DatasetTester(db_path, encoder, similarity_type)
+                ans = {
+                    "question_idx": question_idx,
+                    "question": qa_pair["question"],
+                    "cluster_label": qa_pair["cluster_label"],
+                    "cluster_desc": qa_pair["cluster_desc"],
+                    "gt_image_ids": qa_pair["image_ids"],
+                    "gt_num": gt_num,
+                    "gt_action": qa_pair["action"],
+                    "retrieved_image_ids": retrieved_ids,
+                    "retrieved_num": len(retrieved_ids),
+                    "items": items,
+                    "avg_similarity": sum(similarities[:gt_num]) / gt_num if similarities else 0,
+                    "max_similarity": max(similarities[:gt_num]) if similarities else 0,
+                    "min_similarity": min(similarities[:gt_num]) if similarities else 0,
+                    "hit": hit
+                }
+                ans_file.append(ans)
+            
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
+                json.dump(ans_file, f, indent=2, ensure_ascii=False)
+        
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
+        
+        return ans_paths
+
+    @staticmethod
+    def get_score(ans_paths = None):
+        if isinstance(ans_paths, str):
+            ans_paths = [ans_paths]
+        results_paths = []
+        for ans_file in ans_paths:
+
+            with open(ans_file, "r") as f:
+                answers = json.load(f)
+            
+            results = []
+
+            for ans in answers:
+                gt_num = ans["gt_num"]
+                gt_video_ids = set(ans["gt_video_ids"])
+                retrieved_video_ids = ans["retrieved_video_ids"]
+                retrieved_num = ans["retrieved_num"]
+                hit_by_id = 0
+                
+                for i, v in enumerate(retrieved_video_ids):
+                    if i < gt_num and (v in gt_video_ids):
+                        hit_by_id += 1
+                        gt_video_ids.remove(v)
+                
+                clean_result = {
+                    "Question": ans["question"],
+                    "gt_action": ans["gt_action"],
+                    "gt_num": gt_num,
+                    "hit_rate": hit_by_id / gt_num if gt_num > 0 else 0,
+                    "avg_similarity": ans["avg_similarity"],
+                    "max_similarity": ans["max_similarity"],
+                    "min_similarity": ans["min_similarity"]
+                }
+                results.append(clean_result)
+            
+            ans_file_root = os.path.dirname(ans_file)
+            result_file_name = os.path.basename(ans_file).split(".")[0] + "_results.json"
+            results_path = os.path.join(ans_file_root, result_file_name)
+            
+            with open(results_path, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            results_paths.append(results_path)
+        return results_paths
     
+    @staticmethod
+    def get_score_image(ans_paths = None):
+        if isinstance(ans_paths, str):
+            ans_paths = [ans_paths]
+        results_paths = []
+        for ans_file in ans_paths:
+
+            with open(ans_file, "r") as f:
+                answers = json.load(f)
+            
+            results = []
+
+            for ans in answers:
+                gt_num = ans["gt_num"]
+                gt_image_ids = set(ans["gt_image_ids"])
+                retrieved_image_ids = ans["retrieved_image_ids"]
+                retrieved_num = ans["retrieved_num"]
+                hit_by_id = 0
+                
+                for i, v in enumerate(retrieved_image_ids):
+                    if i < gt_num and (v in gt_image_ids):
+                        hit_by_id += 1
+                        gt_image_ids.remove(v)
+                
+                clean_result = {
+                    "Question": ans["question"],
+                    "gt_action": ans["gt_action"],
+                    "gt_num": gt_num,
+                    "hit_rate": hit_by_id / gt_num if gt_num > 0 else 0,
+                    "avg_similarity": ans["avg_similarity"],
+                    "max_similarity": ans["max_similarity"],
+                    "min_similarity": ans["min_similarity"]
+                }
+                results.append(clean_result)
+            
+            ans_file_root = os.path.dirname(ans_file)
+            result_file_name = os.path.basename(ans_file).split(".")[0] + "_results.json"
+            results_path = os.path.join(ans_file_root, result_file_name)
+            
+            with open(results_path, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            results_paths.append(results_path)
+        return results_paths
+
+
+def run_test_configurations(config, db_path, encoder, similarity_type, table_name="video_embeddings"):
+    tester = DatasetTester(db_path, encoder, similarity_type, table_name)
+    # optional
+    # patch_weights = [0.8] * 9 + [2.8]
+    # assert len(patch_weights) == 10
+    # tester.set_patch_weights(patch_weights)
+
     for key, item in config.items():
         print(f"\n{'='*50}")
         print(f"Testing: {key}")
@@ -301,342 +834,392 @@ def run_test_configurations(config, db_path, encoder, similarity_type):
         
         dataset_path = item["dataset_path"]
         dataset = UFC101QADataset(dataset_path)
-        ans_path = tester.test_dataset_batch_query(
+        # ans_paths = tester.test_dataset_batch_query(
+        #     dataset=dataset,
+        #     ans_path=item["ans_path"],
+        #     return_all=item.get("return_all", False),
+        #     where_clause=item.get("where_clause", False),
+        #     only_label=item.get("only_label", False)
+        # )
+        # ans_paths = tester.test_dataset_batch_query_merge_description(
+        #     dataset=dataset,
+        #     ans_path=item["ans_path"],
+        #     return_all=item.get("return_all", False),
+        #     where_clause=item.get("where_clause", False),
+        #     only_label=item.get("only_label", False)
+        # )
+        # ans_paths = tester.test_dataset_batch_query_s40a(
+        #     dataset=dataset,
+        #     ans_path=item["ans_path"],
+        #     return_all=item.get("return_all", False),
+        #     where_clause=item.get("where_clause", False),
+        #     only_label=item.get("only_label", False)
+        # )
+        # ans_paths = tester.test_dataset_batch_query_merge_desc_s40a(
+        #     dataset=dataset,
+        #     ans_path=item["ans_path"],
+        #     return_all=item.get("return_all", False),
+        #     where_clause=item.get("where_clause", False),
+        #     only_label=item.get("only_label", False)
+        # )
+        ans_paths = tester.test_dataset_batch_image_query_desc_s40a(
             dataset=dataset,
             ans_path=item["ans_path"],
             return_all=item.get("return_all", False),
             where_clause=item.get("where_clause", False),
             only_label=item.get("only_label", False)
         )
-        
-        results_path = tester.get_score(ans_path)
-        print(f"Results stored at: {results_path}")
+        # results_path = tester.get_score_image(ans_paths)
+        # results_path = tester.get_score(ans_paths)
+        # print(f"Results stored at: {results_path}")
 
-def test_dataset(dataset: UFC101QADataset, db_path, ans_path, return_all = False):
-    tester = DatasetTester(db_path)
-    return tester.test_dataset(dataset, ans_path, return_all=return_all)
+def get_gt(return_all_file):
+    with open(return_all_file, "r") as f:
+        data = json.load(f)
+    gt_data = []
+    for query_result in data:
+        gt_action = query_result["gt_action"]
+        gt_items = []
+        retrieved_video_ids = []
+        similarities = []
+        for item in query_result["items"]:
+            if item.get("action_actegory", None) == gt_action or item.get("action_category", None) == gt_action:
+                gt_items.append(item)
+                retrieved_video_ids.append(item["video_id"])
+                similarities.append(item["similarity"])
 
+        to_be_replaced = {"retrieved_video_ids", "retrieved_num", "items", "avg_similarity", "max_similarity", "min_similarity", "hit"}
+        new_query_result = {}
+        for key, value in query_result.items():
+            if key not in to_be_replaced:
+                new_query_result[key] = value
+        updated = {
+            "retrieved_video_ids": retrieved_video_ids,
+            "retrieved_num": len(retrieved_video_ids),
+            "items": gt_items,
+            "avg_similarity": sum(similarities) / len(retrieved_video_ids) if retrieved_video_ids else 0,
+            "max_similarity": max(similarities) if retrieved_video_ids else 0,
+            "min_similarity": min(similarities) if retrieved_video_ids else 0,
+            "hit": 1
+        }
+        new_query_result = new_query_result | updated
+        # new_query_result = {
+        #     "question_idx": query_result["question_idx"],
+        #     "question": query_result["question"],
+        #     "gt_video_ids": query_result["gt_video_ids"],
+        #     "gt_num": query_result["gt_num"],
+        #     "gt_action": query_result["gt_action"],
+        #     "retrieved_video_ids": retrieved_video_ids,
+        #     "retrieved_num": len(retrieved_video_ids),
+        #     "items": gt_items,
+        #     "avg_similarity": sum(similarities) / len(retrieved_video_ids) if retrieved_video_ids else 0,
+        #     "max_similarity": max(similarities) if retrieved_video_ids else 0,
+        #     "min_similarity": min(similarities) if retrieved_video_ids else 0,
+        #     "hit": 1
+        # }
+        gt_data.append(new_query_result)
 
-def test_dataset_action_label_query(dataset: UFC101QADataset, db_path, ans_path, return_all = False):
-    tester = DatasetTester(db_path)
-    return tester.test_dataset(
-        dataset, ans_path, 
-        return_all=return_all, 
-        use_action_as_query=True
-    )
+    file_path = return_all_file.replace("return_all", "gt")
+    with open(file_path, "w") as f:
+        json.dump(gt_data, f, indent=2)
+    print(f"dump {file_path}")
+    gt_result_path = DatasetTester.get_score(file_path)
 
+def get_gt_image_by_query(return_all_file):
+    with open(return_all_file, "r") as f:
+        data = json.load(f)
+    gt_data = []
+    for query_result in data:
+        gt_image = query_result["gt_image_ids"][0]
+        gt_items = []
+        retrieved_image_ids = []
+        similarities = []
+        for item in query_result["items"]:
+            if item["image_id"] == gt_image:
+                gt_items.append(item)
+                retrieved_image_ids.append(item["image_id"])
+                similarities.append(item["similarity"])
 
-def get_gt_similarity(dataset: UFC101QADataset, db_path, ans_path, only_label = False):
-    tester = DatasetTester(db_path)
-    return tester.test_dataset(
-        dataset, ans_path,
-        where_clause=True,
-        only_label=only_label
-    )
+        to_be_replaced = {"retrieved_image_ids", "retrieved_num", "items", "avg_similarity", "max_similarity", "min_similarity", "hit"}
+        new_query_result = {}
+        for key, value in query_result.items():
+            if key not in to_be_replaced:
+                new_query_result[key] = value
+        updated = {
+            "retrieved_image_ids": retrieved_image_ids,
+            "retrieved_num": len(retrieved_image_ids),
+            "items": gt_items,
+            "avg_similarity": sum(similarities) / len(retrieved_image_ids) if retrieved_image_ids else 0,
+            "max_similarity": max(similarities) if retrieved_image_ids else 0,
+            "min_similarity": min(similarities) if retrieved_image_ids else 0,
+            "hit": 1
+        }
+        new_query_result = new_query_result | updated
+        gt_data.append(new_query_result)
 
+    file_path = return_all_file.replace("return_all", "gt")
+    with open(file_path, "w") as f:
+        json.dump(gt_data, f, indent=2)
+    
+    gt_result_path = DatasetTester.get_score_image(file_path)
 
-def get_score(ans_file):
-    tester = DatasetTester("")  # db_path not needed for scoring
-    return tester.get_score(ans_file)
+def get_gt_image(return_all_file):
+    with open(return_all_file, "r") as f:
+        data = json.load(f)
+    gt_data = []
+    for query_result in data:
+        gt_action = query_result["gt_action"]
+        gt_items = []
+        retrieved_image_ids = []
+        similarities = []
+        for item in query_result["items"]:
+            if item.get("action_actegory", None) == gt_action or item.get("action_category", None) == gt_action:
+                gt_items.append(item)
+                retrieved_image_ids.append(item["image_id"])
+                similarities.append(item["similarity"])
+
+        to_be_replaced = {"retrieved_image_ids", "retrieved_num", "items", "avg_similarity", "max_similarity", "min_similarity", "hit"}
+        new_query_result = {}
+        for key, value in query_result.items():
+            if key not in to_be_replaced:
+                new_query_result[key] = value
+        updated = {
+            "retrieved_image_ids": retrieved_image_ids,
+            "retrieved_num": len(retrieved_image_ids),
+            "items": gt_items,
+            "avg_similarity": sum(similarities) / len(retrieved_image_ids) if retrieved_image_ids else 0,
+            "max_similarity": max(similarities) if retrieved_image_ids else 0,
+            "min_similarity": min(similarities) if retrieved_image_ids else 0,
+            "hit": 1
+        }
+        new_query_result = new_query_result | updated
+        gt_data.append(new_query_result)
+
+    file_path = return_all_file.replace("return_all", "gt")
+    with open(file_path, "w") as f:
+        json.dump(gt_data, f, indent=2)
+    
+    gt_result_path = DatasetTester.get_score_image(file_path)
 
 
 if __name__ == "__main__":
-    # You can change the paths
-    # config = {
-    #     "ans_file": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_real_qa_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root,"ans_file.json"),
-    #         "return_all": False,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     },
-    #     "ans_file_only_label": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_real_qa_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_only_label.json"),
-    #         "return_all": False,
-    #         "where_clause": False,
-    #         "only_label": True
-    #     },
-    #     "ans_file_replaced": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_replaced_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_replaced.json"),
-    #         "return_all": False,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     },
-    #     "ans_file_gt": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_real_qa_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_gt.json"),
-    #         "return_all": False,
-    #         "where_clause": True,
-    #         "only_label": False
-    #     },
-    #     "ans_file_only_label_gt": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_real_qa_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_only_label_gt.json"),
-    #         "return_all": False,
-    #         "where_clause": True,
-    #         "only_label": True
-    #     },
-    #     "ans_file_replaced_gt": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_replaced_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_replaced_gt.json"),
-    #         "return_all": False,
-    #         "where_clause": True,
-    #         "only_label": False
-    #     },
-    #     "ans_file_return_all": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_real_qa_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_return_all.json"),
-    #         "return_all": True,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     },
-    #     "ans_file_only_label_return_all": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_real_qa_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_only_label_return_all.json"),
-    #         "return_all": True,
-    #         "where_clause": False,
-    #         "only_label": True
-    #     },
-    #     "ans_file_replaced_return_all": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_replaced_dataset.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_replaced_return_all.json"),
-    #         "return_all": True,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     },
-    #     "ans_file_only_action_description": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_replaced_dataset_copy.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_only_action_description.json"),
-    #         "return_all": False,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     },
-    #     "ans_file_only_action_description_gt": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_replaced_dataset_copy.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_only_action_description_gt.json"),
-    #         "return_all": False,
-    #         "where_clause": True,
-    #         "only_label": False
-    #     },
-    #     "ans_file_only_action_description_return_all": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/ufc101_dataset/ucf101_replaced_dataset_copy.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_only_action_description_return_all.json"),
-    #         "return_all": True,
-    #         "where_clause": False,
-    #         "only_label": False,
-    #     },
-    # }
     
-    # config_new_only_action_description = {
-    #     "ans_file_ucf101_vqa_dataset_with_descriptions": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiment_test/vqa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_new_only_action_description.json"),
-    #         "return_all": False,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     },
-    #     "ans_file_ucf101_vqa_dataset_with_descriptions_gt": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiment_test/vqa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_new_only_action_description_gt.json"),
-    #         "return_all": False,
-    #         "where_clause": True,
-    #         "only_label": False
-    #     },
-    #     "ans_file_ucf101_vqa_dataset_with_descriptions_return_all": {
-    #         "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiment_test/vqa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-    #         "ans_path": os.path.join(ans_file_root, "ans_file_new_only_action_description_return_all.json"),
-    #         "return_all": True,
-    #         "where_clause": False,
-    #         "only_label": False
-    #     }
-    # }
     db_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/ufc101_db"
     db_path_iv2 = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/ufc101_iv2_db"
     db_path_llava = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/ufc101_llava_db"
-    ans_file_root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_26_experiments/results_description_llava"
+    db_path_s40a_e5v = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/s40a_e5v_db"
+    db_path_s40a_llava = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/s40a_llava_db"
+    db_path_s40a_vlm2vec = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/s40a_vlm2vec_db"
+    ans_file_root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_22_experiments/results/9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean"
     os.makedirs(ans_file_root, exist_ok=True)
-    config_8_22_multi_descriptions = {
-        "ans_file_ucf101_vqa_multiple_descriptions": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_multiple_descriptionsjson"),
+    
+    config_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean = {
+        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean.json"),
             "return_all": False,
             "where_clause": False,
             "only_label": False
         },
-        "ans_file_ucf101_vqa_multiple_descriptions_gt": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_multiple_descriptions_gt.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_ucf101_vqa_multiple_descriptions_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_multiple_descriptions_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_8_22_ratio = {
-        "ans_file_ucf101_vqa_retrieval_ratio": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_retrieval_ratio.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_retrieval_ratio.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_ucf101_vqa_retrieval_ratio_gt": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_retrieval_ratio.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_retrieval_ratio_gt.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_ucf101_vqa_retrieval_ratio_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_retrieval_ratio.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_retrieval_ratio_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_8_22_iv2_ratio = {
-        "ans_file_ucf101_vqa_retrieval_ratio_iv2": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_retrieval_ratio.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_retrieval_ratio_iv2.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_ucf101_vqa_retrieval_ratio_gt_iv2": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_retrieval_ratio.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_retrieval_ratio_gt_iv2.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_ucf101_vqa_retrieval_ratio_return_all_iv2": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_retrieval_ratio.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_ucf101_vqa_retrieval_ratio_return_all_iv2.json"),
+        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_return_all.json"),
             "return_all": True,
             "where_clause": False,
             "only_label": False
         }
     }
 
-    config_8_22_ev5_description_cosine_max_mean = {
-        "ans_file_8_22_ev5_description_cosine_max_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_22_ev5_description_cosine_max_mean.json"),
+    config_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max = {
+        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max.json"),
             "return_all": False,
             "where_clause": False,
             "only_label": False
         },
-        "ans_file_8_22_ev5_description_cosine_max_mean_gt": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_22_ev5_description_cosine_max_mean_gt.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_8_22_ev5_description_cosine_max_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_22_ev5_description_cosine_max_mean_return_all.json"),
+        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max_return_all.json"),
             "return_all": True,
             "where_clause": False,
             "only_label": False
         }
     }
 
-    config_8_22_ev5_description_cosine_mean = {
-        "ans_file_8_22_ev5_description_cosine_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_22_ev5_description_cosine_mean.json"),
+    config_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean = {
+        "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean.json"),
             "return_all": False,
             "where_clause": False,
             "only_label": False
         },
-        "ans_file_8_22_ev5_description_cosine_mean_gt": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_22_ev5_description_cosine_mean_gt.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_8_22_ev5_description_cosine_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_22_ev5_description_cosine_mean_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_8_23_ev5_description_cosine_mean = {
-        "ans_file_8_23_ev5_description_cosine_max_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "test.json"),
-            "return_all": False,
-            "where_clause": False
-        }
-    }
-
-    # cosine max min
-    config_8_25_ev5_description_cosine_mean = {
-        "ans_file_8_25_ev5_description_cosine_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_25_ev5_description_cosine_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_8_25_ev5_description_cosine_mean_gt": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_25_ev5_description_cosine_mean_gt.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_8_25_ev5_description_cosine_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_25_ev5_description_cosine_mean_return_all.json"),
+        "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean_return_all.json"),
             "return_all": True,
             "where_clause": False,
             "only_label": False
         }
     }
 
-    config_8_26_llava_description_cosine_max_mean = {
-        "ans_file_8_26_llava_description_cosine_max_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_26_llava_description_cosine_max_mean.json"),
+    config_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean = {
+        "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean.json"),
             "return_all": False,
             "where_clause": False,
             "only_label": False
         },
-        "ans_file_8_26_llava_description_cosine_max_mean_gt": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_26_llava_description_cosine_max_mean_gt.json"),
-            "return_all": False,
-            "where_clause": True,
-            "only_label": False
-        },
-        "ans_file_8_26_llava_description_cosine_max_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_25_experiments/datasets/ucf101_vqa_only_description.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_8_26_llava_description_cosine_max_mean_return_all.json"),
+        "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean_return_all.json"),
             "return_all": True,
             "where_clause": False,
             "only_label": False
         }
     }
 
+    config_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean = {
+        "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        },
+        "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean_return_all": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean_return_all.json"),
+            "return_all": True,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
 
-    p= "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_22_results/ucf101_qa_datasets/ucf101_vqa_dataset_with_descriptions.json"
+    config_9_8_llava_s40a_merged_multi_query_template5_weighted_10patches_colbert_maxsim_mean = {
+        "ans_file_9_8_llava_s40a_merged_multi_query_template5_weighted_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_8_llava_s40a_merged_multi_query_template5_weighted_10patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+
+    config_9_8_llava_s40a_merged_multi_query_template5_no_patches_colbert_maxsim_mean = {
+        "ans_file_9_8_llava_s40a_merged_multi_query_template5_no_patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_8_llava_s40a_merged_multi_query_template5_no_patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+
+    config_9_10_llava_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean = {
+        "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+
+    config_9_10_llava_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean = {
+        "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_11_vlm2vec_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean = {
+        "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_11_vlm2vec_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean = {
+        "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_11_vlm2vec_s40a_merged_multi_query_template5_10_patches_colbert_maxsim_mean = {
+        "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_10_patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_10_patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_11_vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean = {
+        "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_11_vlm2vec_s40a_merged_multi_label_generated_query_nopatches_colbert_maxsim_mean = {
+        "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_nopatches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_nopatches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_12_llave_s40a_only_label_5patches_colbert_maxsim_mean = {
+        "ans_file_9_12_llave_s40a_only_label_5patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_only_label.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_12_llave_s40a_only_label_5patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean = {
+        "ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_only_label.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+    config_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean = {
+        "ans_file_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_16_experiments/results/label_split_basedon_query_nopatches/stanford40actions_image2image.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean.json"),
+            "return_all": False,
+            "where_clause": False,
+            "only_label": False
+        }
+    }
+
+
     # iv2_encoder = InternVideo2Encoder()
     llava_encoder = LLaVAQwenEncoder()
-    similarity_type = "cosine_max_mean"
-    run_test_configurations(config_8_26_llava_description_cosine_max_mean, db_path_llava, llava_encoder, similarity_type)
-    
+    # e5v_encoder = E5VVideoEncoder()
+    # vlm2vec_encoder = VLM2VecEncoder()
+    similarity_type = "colbert_maxsim_mean" # "cosine_max_mean" # "colbert_maxsim_mean"
+    # retriever = LanceDBVideoRetriever(encoder=llava_encoder, db_path=db_path_s40a_llava, table_name="image_17patches_embeddings")
+    # breakpoint()
+    # print("end")
+    run_test_configurations(config_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean, db_path_s40a_llava, llava_encoder, similarity_type, "image_embeddings")
+    # dataset = UFC101QADataset("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_27_experiments/dataset/ucf101_vqa_multiple_descriptions_fixed.json")
+    # get_gt("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_29_experiments/results/ufc101_llava_10desc_colbert_max_mean/ans_file_8_29_llava_10_descriptions_colbert_maxsim_mean_return_all_0_54.json")
     

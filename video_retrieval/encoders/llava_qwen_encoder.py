@@ -19,7 +19,7 @@ class LLaVAQwenEncoder:
 
         print(f"Loading llava model: {model_name}")
         self.device = "cuda"
-        self.tokenizer, self.model, self.image_processor, self.max_length = load_pretrained_model(pretrained, None, model_name, device_map="auto", attn_implementation=None)  # Add any other thing you want to pass in llava_model_args
+        self.tokenizer, self.model, self.image_processor, self.max_length = load_pretrained_model(pretrained, None, model_name, device_map="auto", attn_implementation="flash_attention_2")  # Add any other thing you want to pass in llava_model_args
         self.model.eval()
         self.video_processor = VideoProcessor()
         self.conv_template = "qwen_1_5" 
@@ -203,12 +203,12 @@ class LLaVAQwenEncoder:
             images = [images]
         return [extract_patches(img, patch_size, overlap_ratio) for img in images]
         
-    def encode_images_patches(self, images, target_resolution=(336,336), patch_size=112, overlap_ratio=0):
+    def encode_images_patches(self, images, target_resolution=(336,336), patch_size=84, overlap_ratio=0):
         if isinstance(images, Image.Image):
             images = [images]
 
         resized_images = self.resize_images(images, target_resolution)
-        images_patches = self.get_images_patches(resized_images)
+        images_patches = self.get_images_patches(resized_images, patch_size=patch_size, overlap_ratio=overlap_ratio)
         assert len(images_patches) == len(images)
 
         img_embs = []
