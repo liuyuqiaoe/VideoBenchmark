@@ -654,8 +654,7 @@ class LanceDBVideoIndex:
         
         return query_results
     
-    def search_clean(self, query_embedding: np.ndarray, queries, query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause: str = " ", return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None, return_gt = []):
-        
+    def search_clean(self, query_embedding: np.ndarray, queries = None, query_token_nums: List[int] = None, top_k: Union[int, List[int]] = 5, where_clause: str = " ", return_all = False, similarity_type: str = None, encoder_type: str = None, encoder_config: dict = None, return_gt = []):
         if similarity_type is None and encoder_config is not None:
             similarity_type = encoder_config["default_similarity"]
         
@@ -1230,6 +1229,29 @@ class LanceDBVideoRetriever:
             self.encoder_config,
             return_gt
         )
+        
+        return results
+    
+    def search_hybrid(self, texts, image_paths, top_k = 20, where_clause = " ", return_all = False, similarity_type = None, return_gt = []):
+        assert len(texts) == len(image_paths)
+        query_embedding = self.encoder.encode_image_text_pairs_from_paths(texts, image_paths)
+        query_token_nums = [1] * len(image_paths)  
+        
+        if query_embedding is None:
+            print("Failed to encode images")
+            return {}
+
+        results = self.index.search_clean(
+            query_embedding=safe_tensor_to_numpy(query_embedding), 
+            query_token_nums=query_token_nums, 
+            top_k=top_k, 
+            where_clause=where_clause, 
+            return_all = return_all, 
+            similarity_type=similarity_type, 
+            encoder_type=self.encoder_type, 
+            encoder_config=self.encoder_config, 
+            return_gt=return_gt
+            )
         
         return results
 
