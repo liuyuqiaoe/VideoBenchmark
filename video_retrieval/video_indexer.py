@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple, Dict, Union
 from PIL import Image
 import cv2
 import os
+import copy
 from pathlib import Path
 import json
 import pickle
@@ -151,6 +152,37 @@ def colbert_maxsim_mean(query_emb: torch.Tensor, video_emb: torch.Tensor, query_
     else:
         max_sim_per_token = s.max(dim=2).values  # [total_query_tokens, video_num]
         return max_sim_per_token.mean(dim=0)  # [video_num]
+
+def colbert_maxsim_weighted_token_sum(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None, query_token_weight = None):
+    query_norm = F.normalize(query_emb, p=2, dim=-1)  # [total_query_tokens, embedding_dim]
+    video_norm = F.normalize(video_emb, p=2, dim=-1)  # [total_video_frames, embedding_dim]
+    s = torch.matmul(query_norm, video_norm.T)  # [total_query_tokens, total_video_frames]
+    
+    # [total_query_tokens, total_video_frames] -> [total_query_tokens, video_num, frame_num]
+    if video_num is not None:
+        s = s.view(query_emb.shape[0], video_num, -1)
+    
+    query_token_weight = torch.full((query_token_nums[0],),1/query_token_nums[0]) if query_token_weight is None else query_token_weight
+    query_token_weight = torch.tensor(query_token_weight) if not isinstance(query_token_weight, torch.Tensor) else query_token_weight
+    query_token_weight = query_token_weight.to(device=query_norm.device, dtype=query_norm.dtype)
+
+    if query_token_nums is not None:
+        similarities = []
+        start_idx = 0
+        for i, token_num in enumerate(query_token_nums):
+            end_idx = start_idx + token_num
+            query_sim = s[start_idx:end_idx]  # [token_num, video_num, frame_num]
+            max_sim_per_token = query_sim.max(dim=2).values  # [token_num, video_num]
+            weighted_token_sim = query_token_weight.unsqueeze(1) * max_sim_per_token
+            similarities.append(weighted_token_sim.sum(dim=0))  # [video_num]
+            start_idx = end_idx
+        return torch.stack(similarities)  # [num_queries, video_num]
+    else:
+        # TODO:
+        query_sim = s.max(dim=2).values  # [total_query_tokens, video_num]
+        wighted_token_sim = query_token_weight.unsqueeze(1) * query_sim 
+        
+        return wighted_token_sim.sum(dim=0)  # [video_num]
 
 def colbert_maxsim_mean_weighted(query_emb: torch.Tensor, video_emb: torch.Tensor, query_token_nums: List[int] = None, video_num: int = None, patch_weights: torch.Tensor = None):
     query_norm = F.normalize(query_emb, p=2, dim=-1)  # [total_query_tokens, embedding_dim]
@@ -300,7 +332,8 @@ SIMILARITY_FUNCTIONS = {
     "euclidean": euclidean_similarity,
     "colbert_maxsim_max": colbert_maxsim_max,
     "colbert_maxsim_mean": colbert_maxsim_mean,
-    "colbert_maxsim_mean_weighted": colbert_maxsim_mean_weighted
+    "colbert_maxsim_mean_weighted": colbert_maxsim_mean_weighted,
+    "colbert_maxsim_weighted_token_sum": colbert_maxsim_weighted_token_sum
 }
 
 ENCODER_CONFIGS = {
@@ -319,7 +352,7 @@ ENCODER_CONFIGS = {
     "llavaqwen": {
         "schema_class": LLaVAQwenSchema,
         "embedding_dim": 3584,
-        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean", "colbert_maxsim_mean_weighted"],
+        "similarity_methods": ["cosine_mean", "cosine_max_mean", "dot_mean", "dot_max", "euclidean", "colbert_maxsim", "colbert_maxsim_max", "colbert_maxsim_mean", "colbert_maxsim_mean_weighted", "colbert_maxsim_weighted_token_sum"],
         "default_similarity": "cosine_max_mean"
     },
     "vlm2vec": {
@@ -361,6 +394,7 @@ class LanceDBVideoIndex:
         
         # add patch weights
         self.custom_patch_weights = None
+        self.custom_query_token_weight = None
         
         self.db = lancedb.connect(db_path)
         
@@ -385,6 +419,18 @@ class LanceDBVideoIndex:
             return self.custom_patch_weights
         else:
             return torch.ones(num_frames, dtype=torch.float32)
+
+    def _get_query_token_weight(self, similarity_type):
+        if similarity_type == "colbert_maxsim_weighted_token_sum" and self.encoder_type == "llavaqwen" and self.custom_query_token_weight is not None:
+            return self.custom_query_token_weight
+        
+        return None
+
+    def set_query_token_weight(self, query_token_weight):
+        if isinstance(query_token_weight, list):
+            query_token_weight = torch.tensor(query_token_weight, dtype=torch.float32)
+        self.custom_query_token_weight = query_token_weight.clone()
+        print(f"Set custom_query_token_weight: {query_token_weight.tolist()}")
     
     def set_patch_weights(self, patch_weights):
         if isinstance(patch_weights, list):
@@ -560,10 +606,11 @@ class LanceDBVideoIndex:
         V_embs = torch.stack(V_embs_list)  # [video_num, num_frames, embedding_dim]
         
         patch_weights = self._get_patch_weights(num_frames, similarity_type)
+        query_token_weight = self._get_query_token_weight(similarity_type)
         
         # TODO: frame mask?
         # [num_queries, video_num] or [video_num] (for single query)
-        similarities = self._calculate_batched_similarity(query_emb_flat, V_embs, None, similarity_type, query_token_nums, patch_weights)
+        similarities = self._calculate_batched_similarity(query_emb_flat, V_embs, None, similarity_type, query_token_nums, patch_weights, query_token_weight)
 
         video_similarities = {}
         for video_path in video_paths:
@@ -780,7 +827,7 @@ class LanceDBVideoIndex:
         
         return query_results
     
-    def _calculate_batched_similarity(self, query_emb: torch.Tensor, V_embs: torch.Tensor, frame_masks = None, similarity_type = None, query_token_nums: List[int] = None, patch_weights: torch.Tensor = None):
+    def _calculate_batched_similarity(self, query_emb: torch.Tensor, V_embs: torch.Tensor, frame_masks = None, similarity_type = None, query_token_nums: List[int] = None, patch_weights: torch.Tensor = None, query_token_weight = None):
         """
         query_emb: [total_query_tokens, embedding_dim]
         V_embs: [video_num, frame_num, embedding_dim]
@@ -808,9 +855,10 @@ class LanceDBVideoIndex:
             V_embs_flat = V_embs.view(-1, embedding_dim) 
             if patch_weights is not None:
                 similarities = similarity_func(query_emb, V_embs_flat, query_token_nums, video_num, patch_weights)
+            elif query_token_weight is not None:
+                similarities = similarity_func(query_emb, V_embs_flat, query_token_nums, video_num, query_token_weight)
             else:
                 similarities = similarity_func(query_emb, V_embs_flat, query_token_nums, video_num)
-        
         # The similaritiese shape:
         # Single query: [video_num]
         # Multiple queries: [num_queries, video_num]
@@ -1206,10 +1254,14 @@ class LanceDBVideoRetriever:
         
         return results
     
-    def search_image(self, images, top_k = 5, where_clause = " ", return_all = False, similarity_type = None, return_gt = []):
+    def search_image(self, images, top_k = 5, where_clause = " ", return_all = False, similarity_type = None, return_gt = [], return_query_item = True):
         if isinstance(images, Image.Image):
             images = [images]
         
+        if return_query_item:
+            if isinstance(top_k, int):
+                top_k 
+
         query_embedding = self.encoder.encode_images(images)
         query_token_nums = [1] * len(images)  
         
@@ -1232,10 +1284,16 @@ class LanceDBVideoRetriever:
         
         return results
     
-    def search_hybrid(self, texts, image_paths, top_k = 20, where_clause = " ", return_all = False, similarity_type = None, return_gt = []):
+    def search_hybrid(self, texts, image_paths, top_k = 20, where_clause = " ", return_all = False, similarity_type = None, return_gt = [], return_target = False):
         assert len(texts) == len(image_paths)
         query_embedding = self.encoder.encode_image_text_pairs_from_paths(texts, image_paths)
-        query_token_nums = [1] * len(image_paths)  
+        query_token_nums = [1] * len(image_paths) 
+
+        if not return_target:
+            if isinstance(top_k, int):
+                top_k += 1
+            else:
+                top_k = [k+1 for k in top_k] 
         
         if query_embedding is None:
             print("Failed to encode images")
@@ -1252,9 +1310,106 @@ class LanceDBVideoRetriever:
             encoder_config=self.encoder_config, 
             return_gt=return_gt
             )
-        
+
+        if not return_target:
+            filtered_item_ids = [[img_path] for img_path in image_paths]
+            final_results = self.filter_out(filtered_item_ids, results, top_k)
+
         return results
 
+    def search_hybrid_weighted_sum(self, texts, image_paths, top_k = 20, where_clause = " ", return_all = False, similarity_type = None, return_gt = [], return_target = False):
+        assert len(texts) == len(image_paths)
+        query_img_embedding = self.encoder.encode_image_from_paths(image_paths)
+        query_text_embedding = self.encoder.encode_texts(texts)
+        query_embedding = torch.stack([query_img_embedding, query_text_embedding], dim=1)
+        query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
+        query_token_nums = [2] * len(image_paths)  
+        
+        if query_embedding is None:
+            print("Failed to encode images")
+            return {}
+        
+        original_top_k = copy.deepcopy(top_k)
+        if not return_target:
+            if isinstance(top_k, int):
+                top_k += 1
+            else:
+                top_k = [k+1 for k in top_k]
+
+        results = self.index.search_clean(
+            query_embedding=safe_tensor_to_numpy(query_embedding), 
+            query_token_nums=query_token_nums, 
+            top_k=top_k, 
+            where_clause=where_clause, 
+            return_all = return_all, 
+            similarity_type=similarity_type, 
+            encoder_type=self.encoder_type, 
+            encoder_config=self.encoder_config, 
+            return_gt=return_gt
+            )
+        
+        if not return_target:
+            filtered_item_ids = [[img_path] for img_path in image_paths]
+            final_results = self.filter_out(filtered_item_ids, results, original_top_k)
+
+        return final_results
+    
+    def search_2images_weighted_sum(self, image1_paths, image2_paths, top_k = 20, where_clause = " ", return_all = False, similarity_type = None, return_gt = [], return_target = False):
+        assert len(image1_paths) == len(image2_paths)
+        query_img1_embedding = self.encoder.encode_image_from_paths(image1_paths)
+        query_img2_embedding = self.encoder.encode_image_from_paths(image2_paths)
+       
+        query_embedding = torch.stack([query_img1_embedding, query_img2_embedding], dim=1)
+        query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
+        query_token_nums = [2] * len(image1_paths)  
+        
+        if query_embedding is None:
+            print("Failed to encode images")
+            return {}
+        
+        original_top_k = copy.deepcopy(top_k)
+        if not return_target:
+            if isinstance(top_k, int):
+                top_k += 1
+            else:
+                top_k = [k+1 for k in top_k]
+
+        results = self.index.search_clean(
+            query_embedding=safe_tensor_to_numpy(query_embedding), 
+            query_token_nums=query_token_nums, 
+            top_k=top_k, 
+            where_clause=where_clause, 
+            return_all = return_all, 
+            similarity_type=similarity_type, 
+            encoder_type=self.encoder_type, 
+            encoder_config=self.encoder_config, 
+            return_gt=return_gt
+            )
+        
+        if not return_target:
+            filtered_item_ids = [[img_path] for img_path in image1_paths]
+            final_results = self.filter_out(filtered_item_ids, results, original_top_k)
+
+        return final_results
+    
+    def filter_out(self, filtered_item_ids, results, top_k):
+        filtered_item_ids = [[os.path.basename(filtered_item_id).rsplit(".", 1)[0] for filtered_item_id in query_filtered_item_ids] for query_filtered_item_ids in filtered_item_ids]
+        assert len(filtered_item_ids) == len(results) and len(filtered_item_ids) == len(top_k)
+        return_results = {}
+        # (item_path, similarity, rank)
+        for query_idx, retrieved_item_lst in results.items():
+            res_lst = []
+            query_filtered_item_ids = filtered_item_ids[query_idx]
+            for (item_path, similarity, rank) in retrieved_item_lst:
+                if os.path.basename(item_path).rsplit(".", 1)[0] not in query_filtered_item_ids:
+                    res_lst.append((item_path, similarity, rank))
+            if top_k:
+                res_lst = res_lst[:top_k[query_idx]]
+
+            return_results[query_idx] = res_lst
+        
+        return return_results
+    
     def formated_results(self, results):
         if not isinstance(results, dict):
             print("Warning: Expected dictionary format for results")

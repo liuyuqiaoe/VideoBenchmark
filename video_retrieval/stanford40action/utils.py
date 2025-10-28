@@ -1,12 +1,16 @@
 import os
 from shutil import copyfile
 import json
+import copy
 import random
 import glob
 import re
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from PIL import Image, ImageDraw
+
+from video_retrieval.utils import resize_and_pad_image
 
 def select_images(k, train_split_dir, output_path, label_filtering=None):
     action_to_images = {}
@@ -163,6 +167,48 @@ def parse_phrases(response):
     
     return phrases
 
+def draw_border(image, border_width=5, border_color=(255, 0, 0)):
+    original_width, original_height = image.size
+    img = copy.deepcopy(image)
+    draw = ImageDraw.Draw(img)
+    
+    draw.line([(0, 0), (img.width, 0)], fill=border_color, width=border_width)
+    draw.line([(0, img.height-border_width//2), (img.width, img.height-border_width//2)], fill=border_color, width=border_width)
+    draw.line([(0, 0), (0, img.height)], fill=border_color, width=border_width)
+    draw.line([(img.width-border_width//2, 0), (img.width-border_width//2 , img.height)], fill=border_color, width=border_width)
+
+    assert img.size[0] == original_width and img.size[1] == original_height
+    return img
+
+def concatenate_images_grid_with_highlight(pil_images, grid_rows=4, grid_cols=5, target_index=[], 
+                                           border_width=5, border_color=(255, 0, 0), 
+                                           save_path=None, target_resolution=(225,225)):
+    pil_images = [resize_and_pad_image(pil_image, target_resolution) for pil_image in pil_images]
+    first_width, first_height = pil_images[0].size
+    if target_index:
+        for index in target_index:
+            target_img = draw_border(pil_images[index], border_width, border_color)
+            pil_images[index] = target_img
+    
+    total_width = first_width * grid_cols
+    total_height = first_height * grid_rows
+    concatenated_img = Image.new('RGB', (total_width, total_height))
+    
+    for i, pil_img in enumerate(pil_images):
+        row = i // grid_cols
+        col = i % grid_cols
+        
+        x = col * first_width
+        y = row * first_height
+        
+        concatenated_img.paste(pil_img, (x, y))
+    
+    if save_path:
+        concatenated_img.save(save_path)
+    
+    return concatenated_img
+
+    
 if __name__ == "__main__":
     # pattern_return_all = "*return_all_[0-9]*_[0-9]*.json"
     # output_file = concat_json_files(dir_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_30_experiments/results/e5v_s40a_single_image", pattern=pattern_return_all)

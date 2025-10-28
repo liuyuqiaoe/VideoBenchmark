@@ -2,6 +2,9 @@ import json
 import os
 import re
 import numpy as np
+from PIL import Image
+
+from video_retrieval.stanford40action.utils import draw_border, concatenate_images_grid_with_highlight
 
 def extract_range_from_filename(filename):
     match = re.search(r'_(\d+)_(\d+)(?:_results)?\.json$', filename)
@@ -24,6 +27,7 @@ def concat_results(results_dir, output_path="/research/d7/fyp25/yqliu2/projects/
         with open(result, "r") as f:
             r_data = json.load(f)
         data += r_data
+    breakpoint()
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -172,10 +176,205 @@ def get_hitrate_ks_analysis(hitrate_ks_file, output_path):
     with open(output_path, "w") as f:
         json.dump(final_result, f, indent=2)
 
-def split_labels_by_hr(hr_ks_analysis_file, output_path):
-        
+def get_hitrate_ks_hybrid(origin_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_7_experiments/results/llave_s40a_hybrid_no_patches_colbert_maxsim_mean/origin.json", output_path=None, k_lst=[1, 2, 3, 5, 10, 20]):
+    with open(origin_path, "r") as f:
+        data = json.load(f)
+    hr_lst = []
+    for q in data:
+        gt_v_id = q["gt_image_id"] + ".jpg"
+        for i, item in enumerate(q["items"]):
+            if item["image_id"] == gt_v_id:
+                hit_rank = i
+                similarity = item["similarity"]
+
+        hitrate_ks = {k: (1 if hit_rank <= (k-1) else 0) for k in k_lst}
+        content = {
+            "question_text": q["question_text"],
+            "question_image": os.path.basename(q["question_image"]),
+            "k_lst": k_lst,
+            "hit_rank": hit_rank,
+            "similarity": similarity,
+            "hitrate_ks": hitrate_ks,
+            "gt_action": q["gt_action"]
+        }
+        hr_lst.append(content)
+
+    with open(output_path, "w") as f:
+        json.dump(hr_lst, f, indent=2)
+
+def get_hitrate_ks_analysis_hybrid(hitrate_ks_file, output_path):
+    with open(hitrate_ks_file, "r") as f:
+        data = json.load(f)
+
+    final_result = {}
+    group_by_question_img = {}
+    total_hit_rank = []
+    for q in data:
+        question_img = q["question_image"]
+        question_text = q["question_text"]
+        content = group_by_question_img.get(question_img, {})
+        total_hit_rank.append(q["hit_rank"])
+        if not content:
+            content = {
+                "question_texts": [question_text],
+                "hitrate_ks": [list(q["hitrate_ks"].values())],
+                "k_lst": q["k_lst"],
+                "hit_ranks": [q["hit_rank"]],
+                "avg_hitrate_ks": [],
+                "avg_hit_rank": "tobedone",
+                "items": [q] 
+            }
+            group_by_question_img[question_img] = content
+        else:
+            content["question_texts"].append(question_text)
+            content["hitrate_ks"].append(list(q["hitrate_ks"].values())),
+            content["hit_ranks"].append(q["hit_rank"]),
+            content["items"].append(q)
+            group_by_question_img[question_img] = content
+
+    for question_img, content in group_by_question_img.items():
+        content["avg_hitrate_ks"] = np.array(content["hitrate_ks"]).mean(axis=0).tolist()
+        # content["avg_hit_rank"] = int(np.array(content["hit_ranks"]).mean())
+    
+    final_result["k_lst"] = list(group_by_question_img.values())[0]["k_lst"]
+    total_hit_rank = np.array(total_hit_rank)
+    # final_result["avg_hit_rank"] = int(total_hit_rank.mean())
+    final_result["avg_hitrate_ks"] = [float((total_hit_rank <= (r-1)).astype(int).mean()) for r in final_result["k_lst"]]
+    max_k = max(final_result["k_lst"])
+    final_result["total_hit_rank"] = total_hit_rank.tolist()
+    final_result["group_by_question_img"] = group_by_question_img
+
+    with open(output_path, "w") as f:
+        json.dump(final_result, f, indent=2)
+
+def image_id_to_path(image_id, dataset_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset"):
+    image_id = image_id.split(".")[0] if image_id.find(".") != -1 else image_id
+    label = image_id.rsplit("_", 1)[0]
+    train = os.path.join(dataset_dir, "train", label)
+    test = os.path.join(dataset_dir, "test", label)
+    image_path = ""
+    for root, dirs, files in os.walk(train):
+        for f in files:
+            if f.split(".")[0] == image_id:
+                image_path = os.path.join(root, f)
+
+    for root, dirs, files in os.walk(test):
+        for f in files:
+            if f.split(".")[0] == image_id:
+                image_path = os.path.join(root, f)
+    return image_path
+    
+def get_big_image(original_file, output_dir):
+    with open(original_file, "r") as f:
+        data = json.load(f)      
+
+    for item in data:
+        img_name = f"{item['question_idx']}_{os.path.basename(item['question_image']).rsplit('.', 1)[0]}_{item['gt_image_id']}.jpg"  
+        img_path = os.path.join(output_dir, img_name)
+        image_ids = item["retrieved_image_ids"][:20]
+        image_paths = [image_id_to_path(image_id) for image_id in image_ids]
+        pil_images = [Image.open(image_path).convert("RGB") for image_path in image_paths]
+
+        gt_image_id = item["gt_image_id"] if isinstance(item["gt_image_id"], str) else item["gt_image_id"][0]
+        rank = []
+        for r in item["items"]:
+            if r["image_id"].split(".")[0] == gt_image_id:
+                rank.append(r["rank"])
+  
+        concatenate_images_grid_with_highlight(
+            pil_images, 
+            grid_rows=4, 
+            grid_cols=5, 
+            target_index=rank, 
+            border_width=5, 
+            border_color=(255, 0, 0), 
+            save_path=img_path
+        )
+
+def get_big_image_i2i(original_file, output_dir):
+    with open(original_file, "r") as f:
+        data = json.load(f)      
+
+    for item in data:
+        img_name = f"{item['question_idx']}_{item['question'].rsplit('.', 1)[0]}.jpg"  
+        img_path = os.path.join(output_dir, img_name)
+        image_ids = item["retrieved_image_ids"][:20]
+        image_paths = [image_id_to_path(image_id) for image_id in image_ids]
+        pil_images = [Image.open(image_path).convert("RGB") for image_path in image_paths]
+
+        gt_image_ids = item["gt_image_ids"] 
+        rank = []
+        for r in item["items"][:20]:
+            if r["image_id"] in gt_image_ids:
+                rank.append(r["rank"])
+  
+        concatenate_images_grid_with_highlight(
+            pil_images, 
+            grid_rows=4, 
+            grid_cols=5, 
+            target_index=rank, 
+            border_width=5, 
+            border_color=(255, 0, 0), 
+            save_path=img_path
+        )
+
+def get_results(origin_path):
+    root = os.path.dirname(origin_path)
+    get_hitrate_ks_hybrid(
+        origin_path=origin_path, 
+        output_path=os.path.join(root, "hr_ks.json"), 
+        )
+    get_hitrate_ks_analysis_hybrid(
+        hitrate_ks_file=os.path.join(root, "hr_ks.json"), 
+        output_path=os.path.join(root, "hr_ks_analysis.json")
+        )
+
 if __name__ == "__main__":
-    # concat_results("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_28_experiments/results/ucf101_multi_desc_llava/origin")
+    # origin_paths = []
+    # for root, ds, fs in os.walk("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_2images/10_22_llave_s40a_imageText2image_no_patches_2imagesquery_colbert_weighted_query_token_sum_50_50"):
+    #     for f in fs:
+    #         if "ans_file" in f:
+    #             origin_paths.append(os.path.join(root, f))
+    # for origin_path in origin_paths:
+    #     get_results(origin_path)
+    
+    get_big_image(
+        original_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_haolin2/results_haolin3/10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_40_60/ans_file_10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_40_60_0_18.json", 
+        output_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_haolin2/results_haolin3/10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_40_60/images"
+        )
+    get_big_image(
+        original_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_haolin2/results_haolin3/10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_50_50/ans_file_10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_50_50_0_18.json", 
+        output_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_haolin2/results_haolin3/10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_50_50/images"
+        )
+    get_big_image(
+        original_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_haolin2/results_haolin3/10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_60_40/ans_file_10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_60_40_0_18.json", 
+        output_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results_haolin2/results_haolin3/10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum_60_40/images"
+        )
+
+    # origin_path = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results/10_22_llave_s40a_imageText2image_no_patches_colbert_weighted_query_token_sum_50_50/ans_file_10_22_llave_s40a_imageText2image_no_patches_colbert_weighted_query_token_sum_50_50_0_210.json"
+    # get_results(origin_path)
+    # concat_origin(
+    #     results_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_7_experiments/results/llave_s40a_hybrid_no_patches_colbert_maxsim_mean/origin",
+    #     output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_7_experiments/results/llave_s40a_hybrid_no_patches_colbert_maxsim_mean/origin.json"
+    #     )
+    # get_hitrate_ks_hybrid(
+    #     origin_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results/10_22_llave_s40a_imageText2image_no_patches_1_9_colbert_weighted_query_token_sum/ans_file_10_22_llave_s40a_imageText2image_no_patches_1_9_colbert_weighted_query_token_sum_0_210.json", 
+    #     output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_15_experiments/results/llave_s40a_imageText2image_no_patches_9_91_colbert_weighted_query_token_sum/9_91_hr_ks.json", 
+    #     )
+    # get_hitrate_ks_analysis_hybrid(
+    #     hitrate_ks_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_15_experiments/results/llave_s40a_imageText2image_no_patches_9_91_colbert_weighted_query_token_sum/9_91_hr_ks.json", 
+    #     output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_15_experiments/results/llave_s40a_imageText2image_no_patches_9_91_colbert_weighted_query_token_sum/9_91_hr_ks_analysis.json"
+    #     )
+    # 
+    # get_big_image_i2i(
+    #     original_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_22_experiments/results/9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean/ans_file_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean_0_42.json", 
+    #     output_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_22_experiments/results/9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean/images"
+    #     )
+    # get_big_image(
+    #     original_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_8_experiments/results/llave_s40a_imageText2image_10_patches_colbert_maxsim_mean/ans_file_10_8_llave_s40a_imageText2image_10_patches_colbert_maxsim_mean_0_210.json", 
+    #     output_dir="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_8_experiments/results/llave_s40a_imageText2image_10_patches_colbert_maxsim_mean/images"
+    #     )
+
     # get_action_mam()
     # concat_origin(
     #     "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin", 
@@ -189,4 +388,15 @@ if __name__ == "__main__":
     #     hitrate_ks_file="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean_hr_ks.json",
     #     output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_11_experiments/results/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean/origin/vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean_final_results.json"
     #     )
-    get_10_25_50(origin_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_12_experiments/results/ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean_0_40.json", output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_12_experiments/results/ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean_hr102550.json")
+    # get_10_25_50(origin_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_12_experiments/results/ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean_0_40.json", output_path="/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_12_experiments/results/ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean_hr102550.json")
+    # with open("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_6_experiments/datasets/ImageText2Image4.json", "r") as f:
+    #     data = json.load(f)
+    # query_imgs = []
+    # for item in data["qa_pairs"]:
+    #     query_imgs.append(item["question_image"])
+    # query_imgs = set(query_imgs)
+    # output_dir = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_8_experiments/results/query_imgs"
+    # for path in query_imgs:
+    #     img = Image.open(path).convert("RGB")
+    #     img_new_path = os.path.join(output_dir, os.path.basename(path))
+    #     img.save(img_new_path)

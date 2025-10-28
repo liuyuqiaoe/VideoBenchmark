@@ -730,6 +730,224 @@ class DatasetTester:
             print(f"Total queries: {len(ans_file)}")
         
         return ans_paths
+    
+    def test_dataset_batch_hybrid_query_s40a(
+        self, 
+        dataset: UFC101QADataset, 
+        ans_path = " ", 
+        return_all = False,
+        where_clause = False,
+        only_label = False,
+        return_gt = True,
+        query_token_weight = [0.1, 0.9]
+    ):  
+        
+        qa_pairs = dataset.qa_pairs
+        qs_texts, qs_images, topk_lst, return_gt_lst  = [], [], [], []
+
+        for qa_pair in qa_pairs:
+            qs_texts.append(qa_pair["question_text"])
+            qs_images.append(qa_pair["question_image"])
+            topk_lst.append(20)
+            if return_gt:
+                gt_lst = copy.deepcopy(qa_pair["image_id"])
+                return_gt_lst.append(gt_lst)
+
+        if not return_gt:
+            return_gt_lst = []
+        
+        # weighted query token sum
+        # query_token_weight = [0.1, 0.9]
+        if self.similarity_type and self.similarity_type == "colbert_maxsim_weighted_token_sum":
+            self.retriever.index.set_query_token_weight(query_token_weight)
+
+        batch_size = 300
+        total_batch = ((len(qs_texts) -1) // batch_size) + 1
+        ans_paths = []
+        for batch_idx in tqdm(range(total_batch)):
+            start = batch_idx * batch_size
+            end = min(start + batch_size - 1, len(qa_pairs))
+            ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
+            qs_texts_batch, qs_images_batch = qs_texts[start:end+1], qs_images[start:end+1]
+            topk_lst_batch = topk_lst[start:end+1]
+            if self.similarity_type:
+                results_multi_queries = self.retriever.search_hybrid_weighted_sum(
+                    texts=qs_texts_batch,
+                    image_paths=qs_images_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type,
+                    return_gt = return_gt_lst
+                )
+            else:
+                # TODO:
+                results_multi_queries = self.retriever.search_hybrid_weighted_sum(
+                    texts=qs_texts_batch,
+                    image_paths=qs_images_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    return_gt = return_gt_lst
+                )
+            
+            ans_file = []
+            
+            for query_idx, query_result in results_multi_queries.items():
+                hit = 0
+                similarities = []
+                retrieved_ids = []
+                items = []
+                question_idx = query_idx + start
+                qa_pair = qa_pairs[question_idx]
+                gt_num = qa_pair["image_count"]
+                for i, (image_path, similarity, rank) in enumerate(query_result):
+                    image_id = os.path.basename(image_path)
+                    retrieved_ids.append(image_id)
+                    item = {
+                        "image_id": image_id,
+                        "similarity": similarity,
+                        "rank": rank,
+                        "action_category": image_id.rsplit("_", 1)[0].strip(),
+                    }
+                    items.append(item)
+                    similarities.append(similarity)
+
+                    if i < gt_num and (image_id in qa_pair["image_id"]):
+                        hit += 1
+
+                ans = {
+                    "question_idx": question_idx,
+                    "question_text": qa_pair["question_text"],
+                    "question_image": qa_pair["question_image"],
+                    "gt_image_id": qa_pair["image_id"][0],
+                    "gt_num": gt_num,
+                    "gt_action": qa_pair["image_id"][0].rsplit("_", 1)[0].strip(),
+                    "retrieved_image_ids": retrieved_ids,
+                    "retrieved_num": len(retrieved_ids),
+                    "items": items,
+                    "avg_similarity": sum(similarities[:gt_num]) / gt_num if similarities else 0,
+                    "max_similarity": max(similarities[:gt_num]) if similarities else 0,
+                    "min_similarity": min(similarities[:gt_num]) if similarities else 0,
+                    "hit": hit
+                }
+                ans_file.append(ans)
+            
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
+                json.dump(ans_file, f, indent=2, ensure_ascii=False)
+        
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
+        
+        return ans_paths
+    
+    def test_dataset_batch_2images_query_s40a(
+        self, 
+        dataset: UFC101QADataset, 
+        ans_path = " ", 
+        return_all = False,
+        where_clause = False,
+        only_label = False,
+        return_gt = True,
+        query_token_weight = [0.1, 0.9]
+    ):  
+        
+        qa_pairs = dataset.qa_pairs
+        qs_texts, qs_images, topk_lst, return_gt_lst  = [], [], [], []
+
+        for qa_pair in qa_pairs:
+            qs_texts.append(qa_pair["question_desc2image"])
+            qs_images.append(qa_pair["question_image"])
+            topk_lst.append(20)
+            gt_lst = copy.deepcopy(qa_pair["image_id"])
+            return_gt_lst.append(gt_lst)
+
+        if not return_gt:
+            return_gt_lst = []
+        
+        # weighted query token sum
+        # query_token_weight = [0.1, 0.9]
+        if self.similarity_type and self.similarity_type == "colbert_maxsim_weighted_token_sum":
+            self.retriever.index.set_query_token_weight(query_token_weight)
+
+        batch_size = 300
+        total_batch = ((len(qs_texts) -1) // batch_size) + 1
+        ans_paths = []
+        for batch_idx in tqdm(range(total_batch)):
+            start = batch_idx * batch_size
+            end = min(start + batch_size - 1, len(qa_pairs))
+            ans_path_batch = ans_path.split(".")[0] + f"_{start}_{end}.json"
+            ans_paths.append(ans_path_batch)
+            qs_texts_batch, qs_images_batch = qs_texts[start:end+1], qs_images[start:end+1]
+            topk_lst_batch = topk_lst[start:end+1]
+            if self.similarity_type:
+                results_multi_queries = self.retriever.search_2images_weighted_sum(
+                    image1_paths=qs_images_batch,
+                    image2_paths=qs_texts_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    similarity_type=self.similarity_type,
+                    return_gt = return_gt_lst
+                )
+            else:
+                # TODO:
+                results_multi_queries = self.retriever.search_2images_weighted_sum(
+                    image1_paths=qs_images_batch,
+                    image2_paths=qs_texts_batch,
+                    top_k=topk_lst_batch,
+                    return_all = return_all,
+                    return_gt = return_gt_lst
+                )
+            
+            ans_file = []
+            
+            for query_idx, query_result in results_multi_queries.items():
+                hit = 0
+                similarities = []
+                retrieved_ids = []
+                items = []
+                question_idx = query_idx + start
+                qa_pair = qa_pairs[question_idx]
+                gt_num = qa_pair["image_count"]
+                for i, (image_path, similarity, rank) in enumerate(query_result):
+                    image_id = os.path.basename(image_path)
+                    retrieved_ids.append(image_id)
+                    item = {
+                        "image_id": image_id,
+                        "similarity": similarity,
+                        "rank": rank,
+                        "action_category": image_id.rsplit("_", 1)[0].strip(),
+                    }
+                    items.append(item)
+                    similarities.append(similarity)
+
+                    if i < gt_num and (image_id in qa_pair["image_id"]):
+                        hit += 1
+
+                ans = {
+                    "question_idx": question_idx,
+                    "question_text": qa_pair["question_desc"],
+                    "question_desc_image": qa_pair["question_desc2image"],
+                    "question_image": qa_pair["question_image"],
+                    "gt_image_id": qa_pair["image_id"][0],
+                    "gt_num": gt_num,
+                    "gt_action": qa_pair["image_id"][0].rsplit("_", 1)[0].strip(),
+                    "retrieved_image_ids": retrieved_ids,
+                    "retrieved_num": len(retrieved_ids),
+                    "items": items,
+                    "avg_similarity": sum(similarities[:gt_num]) / gt_num if similarities else 0,
+                    "max_similarity": max(similarities[:gt_num]) if similarities else 0,
+                    "min_similarity": min(similarities[:gt_num]) if similarities else 0,
+                    "hit": hit
+                }
+                ans_file.append(ans)
+            
+            with open(ans_path_batch, "w", encoding='utf-8') as f:
+                json.dump(ans_file, f, indent=2, ensure_ascii=False)
+        
+            print(f"Results dumped to: {ans_path_batch}")
+            print(f"Total queries: {len(ans_file)}")
+        
+        return ans_paths
 
     @staticmethod
     def get_score(ans_paths = None):
@@ -862,13 +1080,30 @@ def run_test_configurations(config, db_path, encoder, similarity_type, table_nam
         #     where_clause=item.get("where_clause", False),
         #     only_label=item.get("only_label", False)
         # )
-        ans_paths = tester.test_dataset_batch_image_query_desc_s40a(
-            dataset=dataset,
+        # ans_paths = tester.test_dataset_batch_image_query_desc_s40a(
+        #     dataset=dataset,
+        #     ans_path=item["ans_path"],
+        #     return_all=item.get("return_all", False),
+        #     where_clause=item.get("where_clause", False),
+        #     only_label=item.get("only_label", False)
+        # )
+        ans_paths = tester.test_dataset_batch_hybrid_query_s40a(
+            dataset=dataset, 
             ans_path=item["ans_path"],
             return_all=item.get("return_all", False),
             where_clause=item.get("where_clause", False),
-            only_label=item.get("only_label", False)
+            only_label=item.get("only_label", False),
+            return_gt=item.get("return_gt", True),
+            query_token_weight=item.get("query_token_weight", [0.1, 0.9])
         )
+        # ans_paths = tester.test_dataset_batch_2images_query_s40a(
+        #     dataset=dataset, 
+        #     ans_path=item["ans_path"],
+        #     return_all=item.get("return_all", False),
+        #     where_clause=item.get("where_clause", False),
+        #     only_label=item.get("only_label", False),
+        #     query_token_weight=item.get("query_token_weight", [0.1, 0.9])
+        # )
         # results_path = tester.get_score_image(ans_paths)
         # results_path = tester.get_score(ans_paths)
         # print(f"Results stored at: {results_path}")
@@ -1010,216 +1245,63 @@ if __name__ == "__main__":
     db_path_s40a_e5v = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/s40a_e5v_db"
     db_path_s40a_llava = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/s40a_llava_db"
     db_path_s40a_vlm2vec = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/databases/s40a_vlm2vec_db"
-    ans_file_root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_22_experiments/results/9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean"
+    ans_file_root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results/10_22_llave_s40a_imageText2image_no_patches_1_9_colbert_weighted_query_token_sum"
     os.makedirs(ans_file_root, exist_ok=True)
     
-    config_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean = {
-        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_mean_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-
-    config_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max = {
-        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_6_llava_s40a_multi_phrase_template5_10patches_colbert_maxsim_max_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-
-    config_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean = {
-        "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_multi_query_template5_10patches_colbert_maxsim_mean_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-
-    config_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean = {
-        "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_10_patches_colbert_maxsim_mean_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-
-    config_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean = {
-        "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        },
-        "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean_return_all": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabelDescripion10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_7_llava_s40a_single_query_template5_weighted_10patches_colbert_maxsim_mean_return_all.json"),
-            "return_all": True,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-
-    config_9_8_llava_s40a_merged_multi_query_template5_weighted_10patches_colbert_maxsim_mean = {
-        "ans_file_9_8_llava_s40a_merged_multi_query_template5_weighted_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_8_llava_s40a_merged_multi_query_template5_weighted_10patches_colbert_maxsim_mean.json"),
+    config_10_15_llave_s40a_imageText2image_no_patches_9_91_colbert_weighted_query_token_sum = {
+        "ans_file_10_15_llave_s40a_imageText2image_no_patches_9_91_colbert_weighted_query_token_sum": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_6_experiments/datasets/ImageText2Image4.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_10_15_llave_s40a_imageText2image_no_patches_9_91_colbert_weighted_query_token_sum.json"),
             "return_all": False,
             "where_clause": False,
             "only_label": False
         }
     }
 
-    config_9_8_llava_s40a_merged_multi_query_template5_no_patches_colbert_maxsim_mean = {
-        "ans_file_9_8_llava_s40a_merged_multi_query_template5_no_patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_8_llava_s40a_merged_multi_query_template5_no_patches_colbert_maxsim_mean.json"),
+    config_10_22_llave_s40a_imageText2image_no_patches_1_9_colbert_weighted_query_token_sum = {
+        "ans_file_10_22_llave_s40a_imageText2image_no_patches_1_9_colbert_weighted_query_token_sum": {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_6_experiments/datasets/ImageText2Image4.json",
+            "ans_path": os.path.join(ans_file_root, "ans_file_10_22_llave_s40a_imageText2image_no_patches_1_9_colbert_weighted_query_token_sum.json"),
             "return_all": False,
             "where_clause": False,
-            "only_label": False
+            "only_label": False,
+            "query_token_weight": [0.1, 0.9]
         }
     }
-
-    config_9_10_llava_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean = {
-        "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean.json"),
+    
+    root = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/results/results_haolin2"
+    os.makedirs(root, exist_ok=True)
+    dir_name = "10_22_llave_s40a_imageText2image_vague_no_patches_imageTexthaolin_colbert_weighted_query_token_sum"
+    # weights = [[0.5, 0.5], [0.4, 0.6], [0.3, 0.7], [0.2, 0.8], [0.1, 0.9], [0, 1]]
+    # weights = [[0.5, 0.5]]
+    # weights = [[0.6, 0.4], [0.7, 0.3], [0.8, 0.2], [0.9, 0.1], [1, 0]]
+    weights = [[0.6, 0.4], [0.7, 0.3], [0.8, 0.2], [0.9, 0.1], [1, 0], [0.5, 0.5], [0.4, 0.6], [0.3, 0.7], [0.2, 0.8], [0.1, 0.9], [0, 1]]
+    dirs = [os.path.join(root, f"{dir_name}_{int(iw*100)}_{int(tw*100)}") for [iw, tw] in weights]
+    for dir_ in dirs:
+        os.makedirs(dir_, exist_ok=True)
+    configs = {}
+    for [iw, tw], dir_ in zip(weights, dirs):
+        config_name = f"ans_file_{os.path.basename(dir_)}"
+        config_item = {
+            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/10_22_experiments/datasets/Img2TextHaolin.json",
+            "ans_path": os.path.join(dir_,config_name + ".json"),
             "return_all": False,
             "where_clause": False,
-            "only_label": False
+            "only_label": False,
+            "return_gt": False,
+            "query_token_weight": [iw, tw]
         }
-    }
-
-    config_9_10_llava_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean = {
-        "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_10_llava_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_11_vlm2vec_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean = {
-        "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_10patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_11_vlm2vec_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean = {
-        "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_5patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_11_vlm2vec_s40a_merged_multi_query_template5_10_patches_colbert_maxsim_mean = {
-        "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_10_patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_10_patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_11_vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean = {
-        "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/Stanford40Action_ImageLabel10Description10template5.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_query_template5_nopatches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_11_vlm2vec_s40a_merged_multi_label_generated_query_nopatches_colbert_maxsim_mean = {
-        "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_nopatches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_multiple_descriptions.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_11_vlm2vec_s40a_merged_multi_label_generated_query_nopatches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_12_llave_s40a_only_label_5patches_colbert_maxsim_mean = {
-        "ans_file_9_12_llave_s40a_only_label_5patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_only_label.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_12_llave_s40a_only_label_5patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean = {
-        "ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/8_29_experiments/datasets/stanford40_output/stanford40_vqa_only_label.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_12_llave_s40a_only_label_10patches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-    config_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean = {
-        "ans_file_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean": {
-            "dataset_path": "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/experiments/9_16_experiments/results/label_split_basedon_query_nopatches/stanford40actions_image2image.json",
-            "ans_path": os.path.join(ans_file_root, "ans_file_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean.json"),
-            "return_all": False,
-            "where_clause": False,
-            "only_label": False
-        }
-    }
-
-
+        configs[config_name] = config_item
+    
     # iv2_encoder = InternVideo2Encoder()
     llava_encoder = LLaVAQwenEncoder()
     # e5v_encoder = E5VVideoEncoder()
     # vlm2vec_encoder = VLM2VecEncoder()
-    similarity_type = "colbert_maxsim_mean" # "cosine_max_mean" # "colbert_maxsim_mean"
+    similarity_type = "colbert_maxsim_weighted_token_sum" # "cosine_max_mean" # "colbert_maxsim_mean"
     # retriever = LanceDBVideoRetriever(encoder=llava_encoder, db_path=db_path_s40a_llava, table_name="image_17patches_embeddings")
     # breakpoint()
     # print("end")
-    run_test_configurations(config_9_22_llave_s40a_image2image_nopatches_colbert_maxsim_mean, db_path_s40a_llava, llava_encoder, similarity_type, "image_embeddings")
+    run_test_configurations(configs, db_path_s40a_llava, llava_encoder, similarity_type, "image_embeddings")
     # dataset = UFC101QADataset("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_27_experiments/dataset/ucf101_vqa_multiple_descriptions_fixed.json")
     # get_gt("/research/d7/fyp25/yqliu2/projects/VideoBenchmark/8_29_experiments/results/ufc101_llava_10desc_colbert_max_mean/ans_file_8_29_llava_10_descriptions_colbert_maxsim_mean_return_all_0_54.json")
     

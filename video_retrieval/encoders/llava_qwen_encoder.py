@@ -56,6 +56,11 @@ class LLaVAQwenEncoder:
 
         return target_embed
     
+    def encode_texts(self, texts):
+        texts = [texts] if isinstance(texts, str) else texts
+        text_embs_lst = [self.encode_text(text) for text in texts]
+        return torch.concat(text_embs_lst, dim=0)
+
     def get_text_token_emb(self, text):
         conv = copy.deepcopy(conv_templates[self.conv_template])
         conv.append_message(conv.roles[0], text)
@@ -305,23 +310,23 @@ if __name__ == "__main__":
     llava_encoder = LLaVAQwenEncoder()
     print("\n")
 
-    print("2. Testing Encoding Image...")
-    query_image = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train/fishing/fishing_156.jpg"
-    gt_image = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/test/fishing/fishing_159.jpg"
-    neg_image = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train/fishing/fishing_191.jpg"
-    images = [query_image, gt_image, neg_image]
-    images = [Image.open(img_path) for img_path in images]
-    text = "Replace this person in this image with a middle-aged man with a stocky build wearing a green fishing vest over a white t-shirt, paired with brown waders, while sporting a baseball cap and sunglasses as he stands in the water holding a fishing rod."
-    query_emb = llava_encoder.encode_image_text_pair(text, images[0])
-    query_img_emb = llava_encoder.encode_image(images[0])
-    gt_img_emb = llava_encoder.encode_image(images[1])
-    neg_img_emb = llava_encoder.encode_image(images[2])
-    sim0 = torch.matmul(query_emb, query_img_emb.T)
-    sim1 = torch.matmul(query_emb, gt_img_emb.T)
-    sim2 = torch.matmul(query_emb, neg_img_emb.T)
+    # print("2. Testing Encoding Image...")
+    # query_image = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train/fishing/fishing_156.jpg"
+    # gt_image = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/test/fishing/fishing_159.jpg"
+    # neg_image = "/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train/fishing/fishing_191.jpg"
+    # images = [query_image, gt_image, neg_image]
+    # images = [Image.open(img_path) for img_path in images]
+    # text = "Replace this person in this image with a middle-aged man with a stocky build wearing a green fishing vest over a white t-shirt, paired with brown waders, while sporting a baseball cap and sunglasses as he stands in the water holding a fishing rod."
+    # query_emb = llava_encoder.encode_image_text_pair(text, images[0])
+    # query_img_emb = llava_encoder.encode_image(images[0])
+    # gt_img_emb = llava_encoder.encode_image(images[1])
+    # neg_img_emb = llava_encoder.encode_image(images[2])
+    # sim0 = torch.matmul(query_emb, query_img_emb.T)
+    # sim1 = torch.matmul(query_emb, gt_img_emb.T)
+    # sim2 = torch.matmul(query_emb, neg_img_emb.T)
     # image_embedding = llava_encoder.get_image_token_emb(image1)
-    print(f"sim0: {sim0}, sim1: {sim1}, sim2: {sim2}")
-    print("\n")
+    # print(f"sim0: {sim0}, sim1: {sim1}, sim2: {sim2}")
+    # print("\n")
 
     # print("3. Testing Encoding Text...")
     # text1 = "applauding"
@@ -344,13 +349,16 @@ if __name__ == "__main__":
     # sim2= torch.matmul(text2_embedding, video_embedding.T)
     # print(sim2)
 
-    print("6. Testing Encoding Image Text Pairs...")
+    # print("6. Testing Encoding Image Text Pairs...")
+    # texts = ["Replace this person in this image with a middle-aged man with a stocky build wearing a green fishing vest over a white t-shirt, paired with brown waders, while sporting a baseball cap and sunglasses as he stands in the water holding a fishing rod."] * 3
+    # images = ["/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train/fishing/fishing_156.jpg"] * 3
+    # embs = llava_encoder.encode_image_text_pairs_from_paths(texts, images)
+    # breakpoint()
+    # print(f"embs size: {embs.size()}")
+    # print("\n")
+
     texts = ["Replace this person in this image with a middle-aged man with a stocky build wearing a green fishing vest over a white t-shirt, paired with brown waders, while sporting a baseball cap and sunglasses as he stands in the water holding a fishing rod."] * 3
-    images = ["/research/d7/fyp25/yqliu2/projects/VideoBenchmark/Stanford40Actions/StanfordActionDataset/train/fishing/fishing_156.jpg"] * 3
-    embs = llava_encoder.encode_image_text_pairs_from_paths(texts, images)
-    breakpoint()
-    print(f"embs size: {embs.size()}")
-    print("\n")
+    embs = llava_encoder.encode_texts(texts)
 
     print("="*60, "Testing LanceDBVideoRetriever Ends", "="*60)
 
