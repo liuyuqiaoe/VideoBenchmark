@@ -1432,7 +1432,7 @@ class LanceDBVideoRetriever:
             )
         
         if not return_target:
-            filtered_item_ids = [[img_path] for img_path in image1_paths]
+            filtered_item_ids = [[img_path] + img2_path for img_path, img2_path in zip(image1_paths, image2_paths)]
             final_results = self.filter_out(filtered_item_ids, results, original_top_k)
 
         return final_results
