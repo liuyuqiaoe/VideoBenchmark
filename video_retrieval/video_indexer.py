@@ -1392,6 +1392,51 @@ class LanceDBVideoRetriever:
 
         return final_results
     
+    def search_image_images_weighted_sum(self, image1_paths, image2_paths, top_k = 20, where_clause = " ", return_all = False, similarity_type = None, return_gt = [], return_target = False):
+        assert len(image1_paths) == len(image2_paths)
+        
+        query_img1_embedding = [self.encoder.encode_image_from_paths(image1_paths)]
+        # query_img2_embedding = self.encoder.encode_image_from_paths(image2_paths)
+        query_img2_paths_lst = [[] for i in range(len(image2_paths[0]))]
+        for img2s in image2_paths:
+            for i, img2 in enumerate(img2s):
+                query_img2_paths_lst[i].append(img2)
+    
+        query_img2_embedding_lst = [self.encoder.encode_image_from_paths(query_img2_paths) for query_img2_paths in query_img2_paths_lst]
+        query_img1_embedding.extend(query_img2_embedding_lst)
+        query_embedding = torch.stack(query_img1_embedding, dim=1)
+        query_embedding = query_embedding.view(-1, query_embedding.size(-1)) # [total_num_tokens, embedding_dim]
+        query_token_nums = [len(image2_paths[0])+1] * len(image1_paths)  
+        
+        if query_embedding is None:
+            print("Failed to encode images")
+            return {}
+        
+        original_top_k = copy.deepcopy(top_k)
+        if not return_target:
+            if isinstance(top_k, int):
+                top_k += 1
+            else:
+                top_k = [k+1 for k in top_k]
+
+        results = self.index.search_clean(
+            query_embedding=safe_tensor_to_numpy(query_embedding), 
+            query_token_nums=query_token_nums, 
+            top_k=top_k, 
+            where_clause=where_clause, 
+            return_all = return_all, 
+            similarity_type=similarity_type, 
+            encoder_type=self.encoder_type, 
+            encoder_config=self.encoder_config, 
+            return_gt=return_gt
+            )
+        
+        if not return_target:
+            filtered_item_ids = [[img_path] for img_path in image1_paths]
+            final_results = self.filter_out(filtered_item_ids, results, original_top_k)
+
+        return final_results
+    
     def filter_out(self, filtered_item_ids, results, top_k):
         filtered_item_ids = [[os.path.basename(filtered_item_id).rsplit(".", 1)[0] for filtered_item_id in query_filtered_item_ids] for query_filtered_item_ids in filtered_item_ids]
         assert len(filtered_item_ids) == len(results) and len(filtered_item_ids) == len(top_k)
